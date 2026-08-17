@@ -13,7 +13,7 @@ Tiiv Atlas is a focused, self-hosted application for documenting sites, rooms, r
 - Role-based access with superadministrator, administrator, and viewer accounts
 - nginx serves the SPA and proxies `/api` to the Go service
 
-## Quick start
+## Production quick start
 
 Requirements: Docker 24+ with Compose v2.
 
@@ -22,29 +22,35 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open `http://localhost:3000`. The development seed account is `admin@tiiv.local` / `atlas123`; change it before exposing the app.
+Set strong, unique database and administrator credentials in `.env`, then run the command above. Open `http://VM_ADDRESS:15467` or configure Nginx Proxy Manager to forward to that address and port.
 
 ## Production deployment
 
-Use the production Compose file. It does not load demo data or the known development password.
+The default Compose file is production-ready. It does not load demo data or the known development password.
 
 ```bash
 cp .env.example .env
 # Set strong, unique POSTGRES_PASSWORD and ADMIN_PASSWORD values.
 # Set DATABASE_URL with the same PostgreSQL credentials.
-docker compose -f docker-compose.prod.yml up -d --build
+docker compose up -d --build
 ```
 
 `ADMIN_EMAIL` and an `ADMIN_PASSWORD` of at least 12 characters create the first administrator only when the users table is empty. They do not overwrite an existing account.
 
-The web service binds to `127.0.0.1:3000` by default. Put an HTTPS reverse proxy such as Caddy, nginx, Traefik, or Cloudflare Tunnel in front of it. To publish directly on another interface, explicitly set `WEB_BIND`, but TLS remains required because production cookies are Secure.
+The production stack publishes only the web gateway on port `15467` by default. PostgreSQL and the Go API have no host ports and remain accessible only through the Compose network. Start the complete stack with:
+
+```bash
+docker compose up -d --build
+```
+
+Configure Nginx Proxy Manager with scheme `http`, the VM's LAN address as the forward hostname, and port `15467`. TLS terminates at Nginx Proxy Manager. Change `WEB_PORT` in `.env` if another host port is required; use a firewall to restrict direct access to that port when appropriate.
 
 Back up the `atlas-postgres` volume regularly. Before upgrades, take a PostgreSQL dump and apply new numbered files from `backend/db/migrations` in order. The baseline migration initializes a new production database; development seed data is never mounted by the production Compose file.
 
 For an existing installation, apply the multitenancy migration after the backup. It preserves existing records and assigns them to `Default Organization`:
 
 ```bash
-docker compose -f docker-compose.prod.yml exec postgres \
+docker compose exec postgres \
   sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/00007_multitenancy.sql'
 ```
 
@@ -52,7 +58,7 @@ The named `atlas-postgres` volume persists data. The initial schema and seed are
 
 ## Local development
 
-Run PostgreSQL with Compose, then:
+For the seeded local stack, use `docker compose -f docker-compose.dev.yml up -d --build`. Alternatively, run PostgreSQL and the application processes separately:
 
 ```bash
 cd backend && DATABASE_URL='postgres://atlas:atlas_change_me@localhost:5432/tiiv_atlas?sslmode=disable' go run ./cmd/api
@@ -69,7 +75,8 @@ The Vite server proxies API calls to port 8080. Useful targets include `make tes
 | `SESSION_SECRET` | Reserved for session-key rotation | development value |
 | `COOKIE_SECURE` | Require HTTPS for cookies | `false` |
 | `API_PORT` | API listen port | `8080` |
-| `WEB_PORT` | Published web port | `3000` |
+| `WEB_BIND` | Interface used by the production web gateway | `0.0.0.0` |
+| `WEB_PORT` | Published web port (`3000` in development Compose) | `15467` in production |
 
 ## Database and sqlc
 
