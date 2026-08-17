@@ -23,6 +23,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
       COOKIE_SECURE: "true"
+      APP_BASE_DOMAIN: ${APP_BASE_DOMAIN:-atlas.tiiv.com.br}
       API_PORT: 8080
       ADMIN_NAME: ${ADMIN_NAME:-Atlas Administrator}
       ADMIN_EMAIL: ${ADMIN_EMAIL:?ADMIN_EMAIL is required}
@@ -48,8 +49,9 @@ services:
     depends_on:
       tiiv-atlas-api:
         condition: service_healthy
+        restart: true
     read_only: true
-    tmpfs: ["/var/cache/nginx", "/var/run", "/tmp"]
+    tmpfs: ["/etc/nginx/conf.d", "/var/cache/nginx", "/var/run", "/tmp"]
     security_opt: ["no-new-privileges:true"]
     networks:
       - atlas-internal

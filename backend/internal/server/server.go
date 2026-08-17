@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -22,13 +25,21 @@ import (
 )
 
 type Server struct {
-	db     *pgxpool.Pool
-	log    *slog.Logger
-	secure bool
+	db         *pgxpool.Pool
+	log        *slog.Logger
+	secure     bool
+	baseDomain string
 }
 
 func BootstrapAdmin(ctx context.Context, db *pgxpool.Pool, name, email, password string) error {
-	if _, err := db.Exec(ctx, `insert into tenants(name,slug) values('Default Organization','default') on conflict(slug) do nothing`); err != nil {
+	if _, err := db.Exec(ctx, `alter table tenants add column if not exists brand_name text;
+		alter table tenants add column if not exists logo_data bytea;
+		alter table tenants add column if not exists logo_content_type text;
+		alter table tenants add column if not exists favicon_data bytea;
+		alter table tenants add column if not exists favicon_content_type text`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(ctx, `insert into tenants(name,slug) select 'Default Organization','default' where not exists(select 1 from tenants)`); err != nil {
 		return err
 	}
 	var count int
@@ -58,30 +69,42 @@ const userKey ctxKey = "user"
 const tenantKey ctxKey = "tenant"
 
 type user struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Email    string `json:"email"`
-	Role     string `json:"role"`
-	TenantID string `json:"tenant_id"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Email      string `json:"email"`
+	Role       string `json:"role"`
+	TenantID   string `json:"tenant_id"`
+	Portal     string `json:"portal"`
+	TenantName string `json:"tenant_name,omitempty"`
+	TenantSlug string `json:"tenant_slug,omitempty"`
+	BaseDomain string `json:"base_domain,omitempty"`
+	BrandName  string `json:"brand_name,omitempty"`
 }
 
 var tenantSlugPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
+var reservedTenantSlugs = map[string]bool{"admin": true, "api": true, "app": true, "auth": true, "global": true, "www": true}
 
 func New(db *pgxpool.Pool, log *slog.Logger, secure bool) http.Handler {
-	s := &Server{db: db, log: log, secure: secure}
+	s := &Server{db: db, log: log, secure: secure, baseDomain: canonicalHostname(os.Getenv("APP_BASE_DOMAIN"))}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, s.securityHeaders, s.requestLog)
 	r.Get("/health", s.health)
 	r.Route("/api/v1", func(r chi.Router) {
+		r.Get("/portal", s.portalInfo)
+		r.Get("/portal/logo", s.portalAsset("logo"))
+		r.Get("/portal/favicon", s.portalAsset("favicon"))
 		r.Post("/auth/login", s.login)
 		r.Post("/auth/logout", s.logout)
 		r.Group(func(r chi.Router) {
 			r.Use(s.authenticate)
 			r.Get("/auth/me", s.me)
 			r.Get("/tenants", s.listTenants)
-			r.Post("/tenants", s.superAdminRequired(s.createTenant))
-			r.Put("/tenants/{id}", s.superAdminRequired(s.updateTenant))
-			r.Post("/tenants/{id}/switch", s.superAdminRequired(s.switchTenant))
+			r.Post("/tenants", s.superAdminGlobalRequired(s.createTenant))
+			r.Put("/tenants/{id}", s.superAdminGlobalRequired(s.updateTenant))
+			r.Post("/tenants/{id}/switch", s.superAdminGlobalRequired(s.switchTenant))
+			r.Put("/tenants/{id}/branding", s.superAdminGlobalRequired(s.updateTenantBranding))
+			r.Get("/tenants/{id}/branding/{asset}", s.superAdminGlobalRequired(s.tenantBrandingAsset))
+			r.Delete("/tenants/{id}/branding/{asset}", s.superAdminGlobalRequired(s.deleteTenantBrandingAsset))
 			r.Post("/auth/change-password", s.changePassword)
 			r.Get("/users", s.superAdminRequired(s.listUsers))
 			r.Post("/users", s.superAdminRequired(s.createUser))
@@ -289,7 +312,145 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"status": "ok", "database": "ok"})
 }
 
+type portalScope struct {
+	Kind            string
+	TenantID        string
+	TenantName      string
+	TenantSlug      string
+	BrandName       string
+	HasLogo         bool
+	HasFavicon      bool
+	BrandingVersion int64
+}
+
+func canonicalHostname(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if name, _, err := net.SplitHostPort(host); err == nil {
+		host = name
+	}
+	return strings.Trim(strings.TrimSuffix(host, "."), "[]")
+}
+
+func matchPortalHost(host, baseDomain string) (kind, slug string, ok bool) {
+	host = canonicalHostname(host)
+	baseDomain = canonicalHostname(baseDomain)
+	if baseDomain == "" {
+		return "unscoped", "", true
+	}
+	if host == baseDomain {
+		return "global", "", true
+	}
+	suffix := "." + baseDomain
+	if !strings.HasSuffix(host, suffix) {
+		return "", "", false
+	}
+	slug = strings.TrimSuffix(host, suffix)
+	if strings.Contains(slug, ".") || !tenantSlugPattern.MatchString(slug) {
+		return "", "", false
+	}
+	return "tenant", slug, true
+}
+
+func (s *Server) resolvePortal(ctx context.Context, host string) (portalScope, error) {
+	kind, slug, ok := matchPortalHost(host, s.baseDomain)
+	if !ok {
+		return portalScope{}, pgx.ErrNoRows
+	}
+	scope := portalScope{Kind: kind, TenantSlug: slug}
+	if kind != "tenant" {
+		return scope, nil
+	}
+	var updatedAt time.Time
+	if err := s.db.QueryRow(ctx, `select id,name,coalesce(nullif(brand_name,''),name),logo_data is not null,favicon_data is not null,updated_at from tenants where slug=$1`, slug).Scan(&scope.TenantID, &scope.TenantName, &scope.BrandName, &scope.HasLogo, &scope.HasFavicon, &updatedAt); err != nil {
+		return portalScope{}, err
+	}
+	scope.BrandingVersion = updatedAt.UnixNano()
+	return scope, nil
+}
+
+func (s *Server) portalURL(slug string) string {
+	if s.baseDomain == "" {
+		return ""
+	}
+	scheme := "http"
+	if s.secure {
+		scheme = "https"
+	}
+	return scheme + "://" + slug + "." + s.baseDomain
+}
+
+func (s *Server) portalInfo(w http.ResponseWriter, r *http.Request) {
+	scope, err := s.resolvePortal(r.Context(), r.Host)
+	if err != nil {
+		fail(w, 404, "PORTAL_NOT_FOUND", "Organization portal not found")
+		return
+	}
+	data := map[string]any{
+		"kind": scope.Kind, "tenant_id": scope.TenantID, "tenant_name": scope.TenantName,
+		"tenant_slug": scope.TenantSlug, "base_domain": s.baseDomain, "brand_name": scope.BrandName,
+		"has_logo": scope.HasLogo, "has_favicon": scope.HasFavicon, "branding_version": scope.BrandingVersion,
+	}
+	if scope.Kind == "tenant" {
+		if scope.HasLogo {
+			data["logo_url"] = fmt.Sprintf("/api/v1/portal/logo?v=%d", scope.BrandingVersion)
+		}
+		if scope.HasFavicon {
+			data["favicon_url"] = fmt.Sprintf("/api/v1/portal/favicon?v=%d", scope.BrandingVersion)
+		}
+	}
+	respond(w, 200, map[string]any{"data": data})
+}
+
+func (s *Server) portalAsset(asset string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		scope, err := s.resolvePortal(r.Context(), r.Host)
+		if err != nil || scope.Kind != "tenant" {
+			http.NotFound(w, r)
+			return
+		}
+		s.serveBrandingAsset(w, r, scope.TenantID, asset)
+	}
+}
+
+func (s *Server) serveBrandingAsset(w http.ResponseWriter, r *http.Request, tenantID, asset string) {
+	dataColumn, typeColumn := "logo_data", "logo_content_type"
+	if asset == "favicon" {
+		dataColumn, typeColumn = "favicon_data", "favicon_content_type"
+	} else if asset != "logo" {
+		http.NotFound(w, r)
+		return
+	}
+	var data []byte
+	var contentType string
+	query := fmt.Sprintf("select %s,%s from tenants where id=$1", dataColumn, typeColumn)
+	if err := s.db.QueryRow(r.Context(), query, tenantID).Scan(&data, &contentType); err != nil || len(data) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = w.Write(data)
+}
+
+func (s *Server) sessionCookie(value string, maxAge int) *http.Cookie {
+	cookie := &http.Cookie{Name: "atlas_session", Value: value, Path: "/", HttpOnly: true, Secure: s.secure, SameSite: http.SameSiteLaxMode, MaxAge: maxAge}
+	if s.baseDomain != "" {
+		cookie.Domain = s.baseDomain
+	}
+	return cookie
+}
+
+func (s *Server) clearLegacySessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{Name: "atlas_session", Path: "/", HttpOnly: true, Secure: s.secure, SameSite: http.SameSiteLaxMode, MaxAge: -1})
+}
+
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
+	scope, portalErr := s.resolvePortal(r.Context(), r.Host)
+	if portalErr != nil {
+		fail(w, 404, "PORTAL_NOT_FOUND", "Organization portal not found")
+		return
+	}
 	var in struct{ Email, Password string }
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
 		fail(w, 400, "INVALID_JSON", "Invalid request")
@@ -303,8 +464,21 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "INVALID_CREDENTIALS", "Invalid email or password")
 		return
 	}
+	if scope.Kind == "global" && u.Role != "superadmin" {
+		fail(w, 401, "INVALID_CREDENTIALS", "Invalid email or password")
+		return
+	}
+	if scope.Kind == "tenant" && u.Role != "superadmin" && (assignedTenant == nil || *assignedTenant != scope.TenantID) {
+		fail(w, 401, "INVALID_CREDENTIALS", "Invalid email or password")
+		return
+	}
 	token := uuid.NewString()
-	if assignedTenant != nil {
+	if scope.Kind == "tenant" {
+		u.TenantID = scope.TenantID
+		u.TenantName = scope.TenantName
+		u.TenantSlug = scope.TenantSlug
+		u.BrandName = scope.BrandName
+	} else if assignedTenant != nil {
 		u.TenantID = *assignedTenant
 	} else if err = s.db.QueryRow(r.Context(), `select id from tenants order by created_at limit 1`).Scan(&u.TenantID); err != nil {
 		fail(w, 500, "TENANT_REQUIRED", "No tenant is available")
@@ -315,18 +489,29 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "SESSION_ERROR", "Could not create session")
 		return
 	}
-	http.SetCookie(w, &http.Cookie{Name: "atlas_session", Value: token, Path: "/", HttpOnly: true, Secure: s.secure, SameSite: http.SameSiteLaxMode, MaxAge: 604800})
+	u.Portal = scope.Kind
+	u.BaseDomain = s.baseDomain
+	if s.baseDomain != "" {
+		s.clearLegacySessionCookie(w)
+	}
+	http.SetCookie(w, s.sessionCookie(token, 604800))
 	respond(w, 200, map[string]any{"data": u})
 }
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie("atlas_session"); err == nil {
 		_, _ = s.db.Exec(r.Context(), "delete from sessions where id=$1", c.Value)
 	}
-	http.SetCookie(w, &http.Cookie{Name: "atlas_session", Path: "/", MaxAge: -1, HttpOnly: true, Secure: s.secure, SameSite: http.SameSiteLaxMode})
+	s.clearLegacySessionCookie(w)
+	http.SetCookie(w, s.sessionCookie("", -1))
 	respond(w, 200, map[string]any{"data": map[string]bool{"ok": true}})
 }
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope, portalErr := s.resolvePortal(r.Context(), r.Host)
+		if portalErr != nil {
+			fail(w, 404, "PORTAL_NOT_FOUND", "Organization portal not found")
+			return
+		}
 		c, err := r.Cookie("atlas_session")
 		if err != nil {
 			fail(w, 401, "UNAUTHENTICATED", "Authentication required")
@@ -343,6 +528,21 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			fail(w, 403, "TENANT_FORBIDDEN", "Tenant access denied")
 			return
 		}
+		if scope.Kind == "global" && u.Role != "superadmin" {
+			fail(w, 403, "GLOBAL_PORTAL_REQUIRED", "Use your organization portal")
+			return
+		}
+		if scope.Kind == "tenant" && u.TenantID != scope.TenantID {
+			fail(w, 403, "TENANT_FORBIDDEN", "Tenant access denied")
+			return
+		}
+		u.Portal = scope.Kind
+		u.BaseDomain = s.baseDomain
+		if scope.Kind == "tenant" {
+			u.TenantName = scope.TenantName
+			u.TenantSlug = scope.TenantSlug
+			u.BrandName = scope.BrandName
+		}
 		ctx := context.WithValue(r.Context(), userKey, u)
 		ctx = context.WithValue(ctx, tenantKey, u.TenantID)
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -353,14 +553,14 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(userKey).(user)
-	query := `select t.id,t.name,t.slug,t.created_at,
+	query := `select t.id,t.name,t.slug,t.created_at,t.updated_at,coalesce(t.brand_name,''),t.logo_data is not null,t.favicon_data is not null,
 		(select count(*) from sites s where s.tenant_id=t.id),
 		(select count(*) from devices d where d.tenant_id=t.id),
 		(select count(*) from users x where x.tenant_id=t.id)
 		from tenants t where t.id=$1 order by t.name`
 	args := []any{u.TenantID}
-	if u.Role == "superadmin" {
-		query = `select t.id,t.name,t.slug,t.created_at,
+	if u.Role == "superadmin" && u.Portal != "tenant" {
+		query = `select t.id,t.name,t.slug,t.created_at,t.updated_at,coalesce(t.brand_name,''),t.logo_data is not null,t.favicon_data is not null,
 			(select count(*) from sites s where s.tenant_id=t.id),
 			(select count(*) from devices d where d.tenant_id=t.id),
 			(select count(*) from users x where x.tenant_id=t.id)
@@ -374,20 +574,34 @@ func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 	type item struct {
-		ID        string    `json:"id"`
-		Name      string    `json:"name"`
-		Slug      string    `json:"slug"`
-		CreatedAt time.Time `json:"created_at"`
-		Sites     int64     `json:"sites"`
-		Devices   int64     `json:"devices"`
-		Users     int64     `json:"users"`
+		ID         string    `json:"id"`
+		Name       string    `json:"name"`
+		Slug       string    `json:"slug"`
+		CreatedAt  time.Time `json:"created_at"`
+		UpdatedAt  time.Time `json:"updated_at"`
+		BrandName  string    `json:"brand_name"`
+		HasLogo    bool      `json:"has_logo"`
+		HasFavicon bool      `json:"has_favicon"`
+		Sites      int64     `json:"sites"`
+		Devices    int64     `json:"devices"`
+		Users      int64     `json:"users"`
+		URL        string    `json:"url"`
+		LogoURL    string    `json:"logo_url,omitempty"`
+		FaviconURL string    `json:"favicon_url,omitempty"`
 	}
 	data := []item{}
 	for rows.Next() {
 		var v item
-		if err := rows.Scan(&v.ID, &v.Name, &v.Slug, &v.CreatedAt, &v.Sites, &v.Devices, &v.Users); err != nil {
+		if err := rows.Scan(&v.ID, &v.Name, &v.Slug, &v.CreatedAt, &v.UpdatedAt, &v.BrandName, &v.HasLogo, &v.HasFavicon, &v.Sites, &v.Devices, &v.Users); err != nil {
 			fail(w, 500, "SCAN_FAILED", "Could not read tenants")
 			return
+		}
+		v.URL = s.portalURL(v.Slug)
+		if v.HasLogo {
+			v.LogoURL = fmt.Sprintf("/api/v1/tenants/%s/branding/logo?v=%d", v.ID, v.UpdatedAt.UnixNano())
+		}
+		if v.HasFavicon {
+			v.FaviconURL = fmt.Sprintf("/api/v1/tenants/%s/branding/favicon?v=%d", v.ID, v.UpdatedAt.UnixNano())
 		}
 		data = append(data, v)
 	}
@@ -404,21 +618,18 @@ func (s *Server) updateTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	in.Name = strings.TrimSpace(in.Name)
 	in.Slug = strings.ToLower(strings.TrimSpace(in.Slug))
-	if in.Name == "" || !tenantSlugPattern.MatchString(in.Slug) {
+	if in.Name == "" || !tenantSlugPattern.MatchString(in.Slug) || reservedTenantSlugs[in.Slug] {
 		fail(w, 422, "INVALID_TENANT", "Name and a valid slug are required")
 		return
 	}
 	id := chi.URLParam(r, "id")
-	var currentSlug string
-	if err := s.db.QueryRow(r.Context(), `select slug from tenants where id=$1`, id).Scan(&currentSlug); errors.Is(err, pgx.ErrNoRows) {
-		fail(w, 404, "TENANT_NOT_FOUND", "Organization not found")
-		return
-	} else if err != nil {
+	var exists bool
+	if err := s.db.QueryRow(r.Context(), `select exists(select 1 from tenants where id=$1)`, id).Scan(&exists); err != nil {
 		fail(w, 500, "QUERY_FAILED", "Could not read organization")
 		return
-	}
-	if currentSlug == "default" {
-		in.Slug = "default"
+	} else if !exists {
+		fail(w, 404, "TENANT_NOT_FOUND", "Organization not found")
+		return
 	}
 	if _, err := s.db.Exec(r.Context(), `update tenants set name=$1,slug=$2,updated_at=now() where id=$3`, in.Name, in.Slug, id); err != nil {
 		fail(w, 422, "TENANT_UPDATE_FAILED", "Could not update organization")
@@ -426,6 +637,106 @@ func (s *Server) updateTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	respond(w, 200, map[string]any{"data": map[string]string{"id": id}})
 }
+
+func readBrandImage(file multipart.File, maxBytes int64, favicon bool) ([]byte, string, error) {
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(data) == 0 || int64(len(data)) > maxBytes {
+		return nil, "", fmt.Errorf("image exceeds the allowed size")
+	}
+	contentType := http.DetectContentType(data)
+	allowed := contentType == "image/png" || contentType == "image/jpeg" || contentType == "image/webp"
+	if favicon {
+		allowed = allowed || contentType == "image/x-icon" || contentType == "image/vnd.microsoft.icon"
+	}
+	if !allowed {
+		return nil, "", fmt.Errorf("unsupported image type")
+	}
+	return data, contentType, nil
+}
+
+func (s *Server) updateTenantBranding(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 3<<20)
+	if err := r.ParseMultipartForm(3 << 20); err != nil {
+		fail(w, 422, "INVALID_BRANDING", "Branding form is too large or invalid")
+		return
+	}
+	brandName := strings.TrimSpace(r.FormValue("brand_name"))
+	if len(brandName) > 80 {
+		fail(w, 422, "INVALID_BRAND_NAME", "Brand name must have at most 80 characters")
+		return
+	}
+	var logoData, faviconData []byte
+	var logoType, faviconType string
+	logoProvided, faviconProvided := false, false
+	if file, _, err := r.FormFile("logo"); err == nil {
+		logoProvided = true
+		defer file.Close()
+		if logoData, logoType, err = readBrandImage(file, 2<<20, false); err != nil {
+			fail(w, 422, "INVALID_LOGO", "Logo must be a PNG, JPEG, or WebP image up to 2 MB")
+			return
+		}
+	} else if !errors.Is(err, http.ErrMissingFile) {
+		fail(w, 422, "INVALID_LOGO", "Could not read logo")
+		return
+	}
+	if file, _, err := r.FormFile("favicon"); err == nil {
+		faviconProvided = true
+		defer file.Close()
+		if faviconData, faviconType, err = readBrandImage(file, 256<<10, true); err != nil {
+			fail(w, 422, "INVALID_FAVICON", "Favicon must be a PNG, ICO, JPEG, or WebP image up to 256 KB")
+			return
+		}
+	} else if !errors.Is(err, http.ErrMissingFile) {
+		fail(w, 422, "INVALID_FAVICON", "Could not read favicon")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	tag, err := s.db.Exec(r.Context(), `update tenants set brand_name=nullif($1,''),
+		logo_data=case when $2 then $3 else logo_data end,
+		logo_content_type=case when $2 then $4 else logo_content_type end,
+		favicon_data=case when $5 then $6 else favicon_data end,
+		favicon_content_type=case when $5 then $7 else favicon_content_type end,
+		updated_at=now() where id=$8`, brandName, logoProvided, logoData, logoType, faviconProvided, faviconData, faviconType, id)
+	if err != nil {
+		fail(w, 422, "BRANDING_UPDATE_FAILED", "Could not update organization branding")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		fail(w, 404, "TENANT_NOT_FOUND", "Organization not found")
+		return
+	}
+	respond(w, 200, map[string]any{"data": map[string]any{"id": id, "logo_updated": logoProvided, "favicon_updated": faviconProvided}})
+}
+
+func (s *Server) deleteTenantBrandingAsset(w http.ResponseWriter, r *http.Request) {
+	asset := chi.URLParam(r, "asset")
+	columnData, columnType := "logo_data", "logo_content_type"
+	if asset == "favicon" {
+		columnData, columnType = "favicon_data", "favicon_content_type"
+	} else if asset != "logo" {
+		fail(w, 404, "ASSET_NOT_FOUND", "Branding asset not found")
+		return
+	}
+	query := fmt.Sprintf("update tenants set %s=null,%s=null,updated_at=now() where id=$1", columnData, columnType)
+	tag, err := s.db.Exec(r.Context(), query, chi.URLParam(r, "id"))
+	if err != nil {
+		fail(w, 500, "BRANDING_DELETE_FAILED", "Could not remove branding asset")
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		fail(w, 404, "TENANT_NOT_FOUND", "Organization not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) tenantBrandingAsset(w http.ResponseWriter, r *http.Request) {
+	s.serveBrandingAsset(w, r, chi.URLParam(r, "id"), chi.URLParam(r, "asset"))
+}
+
 func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Name string `json:"name"`
@@ -437,7 +748,7 @@ func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	in.Name = strings.TrimSpace(in.Name)
 	in.Slug = strings.ToLower(strings.TrimSpace(in.Slug))
-	if in.Name == "" || !tenantSlugPattern.MatchString(in.Slug) {
+	if in.Name == "" || !tenantSlugPattern.MatchString(in.Slug) || reservedTenantSlugs[in.Slug] {
 		fail(w, 422, "INVALID_TENANT", "Name and a valid slug are required")
 		return
 	}
@@ -463,6 +774,10 @@ func (s *Server) switchTenant(w http.ResponseWriter, r *http.Request) {
 	if _, err = s.db.Exec(r.Context(), `update sessions set tenant_id=$1 where id=$2`, id, cookie.Value); err != nil {
 		fail(w, 500, "TENANT_SWITCH_FAILED", "Could not switch tenant")
 		return
+	}
+	if s.baseDomain != "" {
+		s.clearLegacySessionCookie(w)
+		http.SetCookie(w, s.sessionCookie(cookie.Value, 604800))
 	}
 	respond(w, 200, map[string]any{"data": map[string]string{"tenant_id": id}})
 }
@@ -532,6 +847,16 @@ func (s *Server) superAdminRequired(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+func (s *Server) superAdminGlobalRequired(next http.HandlerFunc) http.HandlerFunc {
+	return s.superAdminRequired(func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(userKey).(user).Portal == "tenant" {
+			fail(w, 403, "GLOBAL_PORTAL_REQUIRED", "Use the global superadministrator portal")
+			return
+		}
+		next(w, r)
+	})
 }
 
 func validUserRole(role string) bool {

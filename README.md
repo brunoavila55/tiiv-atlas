@@ -10,6 +10,7 @@ Tiiv Atlas is a focused, self-hosted application for documenting sites, rooms, r
 - Go 1.26, chi, pgx, PostgreSQL, REST/JSON, structured `slog` logging
 - PostgreSQL constraints protect rack placement, cable endpoints, IP uniqueness, and VLAN ranges
 - Organization-based multitenancy with API filtering and database-enforced cross-tenant reference protection
+- Per-organization white label with custom portal name, logo, and favicon
 - Role-based access with superadministrator, administrator, and viewer accounts
 - nginx serves the SPA and proxies `/api` to the Go service
 
@@ -45,6 +46,12 @@ docker compose up -d --build
 
 Configure Nginx Proxy Manager with scheme `http`, the VM's LAN address as the forward hostname, and port `15467`. TLS terminates at Nginx Proxy Manager. Change `WEB_PORT` in `.env` if another host port is required; use a firewall to restrict direct access to that port when appropriate.
 
+### Tenant subdomains
+
+Set `APP_BASE_DOMAIN=atlas.tiiv.com.br` to enable host-based tenant portals. The base address `https://atlas.tiiv.com.br` becomes the global superadministrator control center. Each organization slug becomes its portal hostname, so the `newlife` slug is available at `https://newlife.atlas.tiiv.com.br`. Login and every authenticated API request verify that the hostname matches the user's organization; an unknown or mismatched subdomain is rejected.
+
+Create DNS records for both `atlas.tiiv.com.br` and `*.atlas.tiiv.com.br` pointing to the Nginx Proxy Manager address. In Nginx Proxy Manager, create one Proxy Host containing both names, forward it with scheme `http` to the VM LAN address on port `15467`, and attach a certificate covering the base and wildcard names. Wildcard Let's Encrypt certificates require a supported DNS challenge. No tenant-specific containers or proxy entries are required after the wildcard is configured.
+
 Back up the `atlas-postgres` volume regularly. Before upgrades, take a PostgreSQL dump and apply new numbered files from `backend/db/migrations` in order. The baseline migration initializes a new production database; development seed data is never mounted by the production Compose file.
 
 For an existing installation, apply the multitenancy migration after the backup. It preserves existing records and assigns them to `Default Organization`:
@@ -74,6 +81,7 @@ The Vite server proxies API calls to port 8080. Useful targets include `make tes
 | `DATABASE_URL` | PostgreSQL connection URL | Compose service URL |
 | `SESSION_SECRET` | Reserved for session-key rotation | development value |
 | `COOKIE_SECURE` | Require HTTPS for cookies | `false` |
+| `APP_BASE_DOMAIN` | Base hostname used for the superadmin portal and tenant subdomains; empty disables hostname enforcement | empty outside production Compose |
 | `API_PORT` | API listen port | `8080` |
 | `WEB_BIND` | Interface used by the production web gateway | `0.0.0.0` |
 | `WEB_PORT` | Published web port (`3000` in development Compose) | `15467` in production |
@@ -105,6 +113,8 @@ Tiiv Atlas prevents deleting the current account and prevents deleting or demoti
 Sites, rooms, racks, devices, models, ports, connections, IPAM, VLANs, and tags belong to one organization. Every authenticated session carries an active organization, every resource query includes that organization, and PostgreSQL triggers reject foreign-key relationships across organizations. Tenant identifiers supplied by clients are ignored on create and update.
 
 Superadministrators are global and land in the **Organizations** control center after signing in. From there they create or edit companies, review site/device/user totals, manage each company's users, and explicitly enter its isolated workspace. Administrators and viewers land directly in their assigned workspace and cannot switch context. User email addresses remain globally unique so one identity cannot ambiguously belong to multiple organizations.
+
+Each organization can have an optional white-label name, logo, and favicon configured from **Organizations → Branding**. PNG, JPEG, and WebP logos up to 2 MB are accepted; favicons may also use ICO and are limited to 256 KB. Branding assets are stored in PostgreSQL, served only from the matching tenant portal, and applied automatically to the login screen, sidebar, browser title, and favicon. The API applies the branding columns idempotently at startup, so an existing installation only needs the normal `docker compose up -d --build` upgrade.
 
 ## Screenshots
 

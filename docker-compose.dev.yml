@@ -21,6 +21,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgres://atlas:atlas_change_me@postgres:5432/tiiv_atlas?sslmode=disable}
       SESSION_SECRET: ${SESSION_SECRET:-development-only-secret-change-me}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      APP_BASE_DOMAIN: ${APP_BASE_DOMAIN:-}
       API_PORT: 8080
     depends_on:
       postgres:
@@ -37,5 +38,6 @@ services:
     depends_on:
       tiiv-atlas-api:
         condition: service_healthy
+        restart: true
 volumes:
   atlas-postgres:
