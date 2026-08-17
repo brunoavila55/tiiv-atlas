@@ -9,7 +9,8 @@ Tiiv Atlas is a focused, self-hosted application for documenting sites, rooms, r
 - React 19, TypeScript, Vite, Tailwind CSS, TanStack Query, React Router, and React Flow
 - Go 1.26, chi, pgx, PostgreSQL, REST/JSON, structured `slog` logging
 - PostgreSQL constraints protect rack placement, cable endpoints, IP uniqueness, and VLAN ranges
-- HTTP-only cookie sessions with admin, operator, and viewer roles
+- Organization-based multitenancy with API filtering and database-enforced cross-tenant reference protection
+- Role-based access with superadministrator, administrator, and viewer accounts
 - nginx serves the SPA and proxies `/api` to the Go service
 
 ## Quick start
@@ -39,6 +40,13 @@ docker compose -f docker-compose.prod.yml up -d --build
 The web service binds to `127.0.0.1:3000` by default. Put an HTTPS reverse proxy such as Caddy, nginx, Traefik, or Cloudflare Tunnel in front of it. To publish directly on another interface, explicitly set `WEB_BIND`, but TLS remains required because production cookies are Secure.
 
 Back up the `atlas-postgres` volume regularly. Before upgrades, take a PostgreSQL dump and apply new numbered files from `backend/db/migrations` in order. The baseline migration initializes a new production database; development seed data is never mounted by the production Compose file.
+
+For an existing installation, apply the multitenancy migration after the backup. It preserves existing records and assigns them to `Default Organization`:
+
+```bash
+docker compose -f docker-compose.prod.yml exec postgres \
+  sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/00007_multitenancy.sql'
+```
 
 The named `atlas-postgres` volume persists data. The initial schema and seed are applied automatically only when the volume is first created.
 
@@ -76,6 +84,20 @@ List endpoints accept `page` and `page_size` (up to 100). The device and network
 ## Security notes
 
 Passwords use bcrypt in PostgreSQL seed data and Go verification. Sessions are opaque UUIDs stored server-side, cookies are HTTP-only and SameSite=Lax, request bodies are limited, SQL values are parameterized, and baseline security headers are applied. Enable `COOKIE_SECURE=true`, use TLS at the reverse proxy, replace all example credentials, and restrict database exposure in production.
+
+### User roles
+
+- `superadmin`: global installation access, organization switching, organization creation, and user administration.
+- `admin`: creates and edits infrastructure only in the organization assigned to the account.
+- `viewer`: read-only access only in the assigned organization; write actions are hidden in the interface and rejected by the API.
+
+Tiiv Atlas prevents deleting the current account and prevents deleting or demoting the final superadministrator. Every user can change their own password from the account menu; changing it revokes their other sessions.
+
+### Multitenancy
+
+Sites, rooms, racks, devices, models, ports, connections, IPAM, VLANs, and tags belong to one organization. Every authenticated session carries an active organization, every resource query includes that organization, and PostgreSQL triggers reject foreign-key relationships across organizations. Tenant identifiers supplied by clients are ignored on create and update.
+
+Superadministrators are global and choose the active organization from **Organizations**. Administrators and viewers are permanently bound to their assigned organization and cannot switch context. User email addresses remain globally unique so one identity cannot ambiguously belong to multiple organizations.
 
 ## Screenshots
 

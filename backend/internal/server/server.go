@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,9 @@ type Server struct {
 }
 
 func BootstrapAdmin(ctx context.Context, db *pgxpool.Pool, name, email, password string) error {
+	if _, err := db.Exec(ctx, `insert into tenants(name,slug) values('Default Organization','default') on conflict(slug) do nothing`); err != nil {
+		return err
+	}
 	var count int
 	if err := db.QueryRow(ctx, `select count(*) from users`).Scan(&count); err != nil {
 		return err
@@ -44,15 +48,24 @@ func BootstrapAdmin(ctx context.Context, db *pgxpool.Pool, name, email, password
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(ctx, `insert into users(name,email,password_hash,role) values($1,$2,$3,'admin')`, name, strings.ToLower(strings.TrimSpace(email)), string(hash))
+	_, err = db.Exec(ctx, `insert into users(name,email,password_hash,role) values($1,$2,$3,'superadmin')`, name, strings.ToLower(strings.TrimSpace(email)), string(hash))
 	return err
 }
 
 type ctxKey string
 
 const userKey ctxKey = "user"
+const tenantKey ctxKey = "tenant"
 
-type user struct{ ID, Name, Email, Role string }
+type user struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Email    string `json:"email"`
+	Role     string `json:"role"`
+	TenantID string `json:"tenant_id"`
+}
+
+var tenantSlugPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
 
 func New(db *pgxpool.Pool, log *slog.Logger, secure bool) http.Handler {
 	s := &Server{db: db, log: log, secure: secure}
@@ -65,6 +78,14 @@ func New(db *pgxpool.Pool, log *slog.Logger, secure bool) http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(s.authenticate)
 			r.Get("/auth/me", s.me)
+			r.Get("/tenants", s.listTenants)
+			r.Post("/tenants", s.superAdminRequired(s.createTenant))
+			r.Post("/tenants/{id}/switch", s.superAdminRequired(s.switchTenant))
+			r.Post("/auth/change-password", s.changePassword)
+			r.Get("/users", s.superAdminRequired(s.listUsers))
+			r.Post("/users", s.superAdminRequired(s.createUser))
+			r.Put("/users/{id}", s.superAdminRequired(s.updateUser))
+			r.Delete("/users/{id}", s.superAdminRequired(s.deleteUser))
 			r.Get("/dashboard", s.dashboard)
 			r.Get("/topology", s.topology)
 			r.Get("/search", s.search)
@@ -118,6 +139,7 @@ type quickDeviceInput struct {
 }
 
 func (s *Server) quickCreateDevice(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Context().Value(tenantKey).(string)
 	var in quickDeviceInput
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&in); err != nil {
 		fail(w, 400, "INVALID_JSON", "Invalid request")
@@ -139,10 +161,22 @@ func (s *Server) quickCreateDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	var siteAllowed bool
+	if err = tx.QueryRow(r.Context(), `select exists(select 1 from sites where id=$1 and tenant_id=$2)`, in.SiteID, tenantID).Scan(&siteAllowed); err != nil || !siteAllowed {
+		fail(w, 422, "SITE_NOT_FOUND", "Site is not available in this tenant")
+		return
+	}
+	if in.RackID != "" {
+		var rackAllowed bool
+		if err = tx.QueryRow(r.Context(), `select exists(select 1 from racks where id=$1 and site_id=$2 and tenant_id=$3)`, in.RackID, in.SiteID, tenantID).Scan(&rackAllowed); err != nil || !rackAllowed {
+			fail(w, 422, "RACK_NOT_FOUND", "Rack is not available in this tenant")
+			return
+		}
+	}
 	var manufacturerID, modelID, deviceID string
-	err = tx.QueryRow(r.Context(), `insert into manufacturers(name) values($1) on conflict(name) do update set name=excluded.name returning id`, strings.TrimSpace(in.Manufacturer)).Scan(&manufacturerID)
+	err = tx.QueryRow(r.Context(), `insert into manufacturers(tenant_id,name) values($1,$2) on conflict(tenant_id,name) do update set name=excluded.name returning id`, tenantID, strings.TrimSpace(in.Manufacturer)).Scan(&manufacturerID)
 	if err == nil {
-		err = tx.QueryRow(r.Context(), `insert into device_models(manufacturer_id,name,height_u) values($1,$2,$3) on conflict(manufacturer_id,name) do update set height_u=excluded.height_u returning id`, manufacturerID, strings.TrimSpace(in.Model), in.RackHeight).Scan(&modelID)
+		err = tx.QueryRow(r.Context(), `insert into device_models(tenant_id,manufacturer_id,name,height_u) values($1,$2,$3,$4) on conflict(manufacturer_id,name) do update set height_u=excluded.height_u returning id`, tenantID, manufacturerID, strings.TrimSpace(in.Model), in.RackHeight).Scan(&modelID)
 	}
 	var rackID any
 	var rackPosition any
@@ -150,7 +184,7 @@ func (s *Server) quickCreateDevice(w http.ResponseWriter, r *http.Request) {
 		rackID, rackPosition = in.RackID, in.RackPosition
 	}
 	if err == nil {
-		err = tx.QueryRow(r.Context(), `insert into devices(name,device_model_id,manufacturer_id,device_type,site_id,rack_id,rack_position,rack_height,management_ip,status,description,power_supply_count,power_input_voltage,power_capacity_watts) values($1,$2,$3,$4,$5,$6,$7,$8,nullif($9,'')::inet,$10,$11,$12,nullif($13,''),nullif($14,0)) returning id`, strings.TrimSpace(in.Name), modelID, manufacturerID, in.DeviceType, in.SiteID, rackID, rackPosition, in.RackHeight, in.ManagementIP, in.Status, in.Purpose, in.PowerSupplyCount, in.PowerInputVoltage, in.PowerCapacityWatts).Scan(&deviceID)
+		err = tx.QueryRow(r.Context(), `insert into devices(tenant_id,name,device_model_id,manufacturer_id,device_type,site_id,rack_id,rack_position,rack_height,management_ip,status,description,power_supply_count,power_input_voltage,power_capacity_watts) values($1,$2,$3,$4,$5,$6,$7,$8,$9,nullif($10,'')::inet,$11,$12,$13,nullif($14,''),nullif($15,0)) returning id`, tenantID, strings.TrimSpace(in.Name), modelID, manufacturerID, in.DeviceType, in.SiteID, rackID, rackPosition, in.RackHeight, in.ManagementIP, in.Status, in.Purpose, in.PowerSupplyCount, in.PowerInputVoltage, in.PowerCapacityWatts).Scan(&deviceID)
 	}
 	for i := 1; i <= in.PowerSupplyCount; i++ {
 		in.Ports = append(in.Ports, quickPort{Name: fmt.Sprintf("PSU%d", i), Type: "power", Speed: in.PowerInputVoltage})
@@ -164,7 +198,7 @@ func (s *Server) quickCreateDevice(w http.ResponseWriter, r *http.Request) {
 			port.Type = "ethernet"
 		}
 		var id string
-		err = tx.QueryRow(r.Context(), `insert into device_ports(device_id,name,type,speed) values($1,$2,$3,nullif($4,'')) returning id`, deviceID, strings.TrimSpace(port.Name), port.Type, port.Speed).Scan(&id)
+		err = tx.QueryRow(r.Context(), `insert into device_ports(tenant_id,device_id,name,type,speed) values($1,$2,$3,$4,nullif($5,'')) returning id`, tenantID, deviceID, strings.TrimSpace(port.Name), port.Type, port.Speed).Scan(&id)
 		portIDs[port.Name] = id
 	}
 	for _, connection := range in.Connections {
@@ -177,18 +211,18 @@ func (s *Server) quickCreateDevice(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		var targetID string
-		err = tx.QueryRow(r.Context(), `select p.id from device_ports p join devices d on d.id=p.device_id where d.site_id=$1 and lower(d.name)=lower($2) and lower(p.name)=lower($3)`, in.SiteID, connection.TargetDeviceName, connection.TargetPortName).Scan(&targetID)
+		err = tx.QueryRow(r.Context(), `select p.id from device_ports p join devices d on d.id=p.device_id where d.site_id=$1 and d.tenant_id=$2 and p.tenant_id=$2 and lower(d.name)=lower($3) and lower(p.name)=lower($4)`, in.SiteID, tenantID, connection.TargetDeviceName, connection.TargetPortName).Scan(&targetID)
 		if err == nil {
 			if connection.CableType == "" {
 				connection.CableType = "cat6"
 			}
-			_, err = tx.Exec(r.Context(), `insert into cables(port_a_id,port_b_id,label,cable_type) values($1,$2,nullif($3,''),$4)`, localID, targetID, connection.Label, connection.CableType)
+			_, err = tx.Exec(r.Context(), `insert into cables(tenant_id,port_a_id,port_b_id,label,cable_type) values($1,$2,$3,nullif($4,''),$5)`, tenantID, localID, targetID, connection.Label, connection.CableType)
 		}
 	}
 	if err == nil && strings.TrimSpace(in.ManagementIP) != "" {
 		var ipID string
 		var assignedDevice *string
-		lookupErr := tx.QueryRow(r.Context(), `select id,device_id::text from ip_addresses where address=$1::inet`, in.ManagementIP).Scan(&ipID, &assignedDevice)
+		lookupErr := tx.QueryRow(r.Context(), `select id,device_id::text from ip_addresses where tenant_id=$1 and address=$2::inet`, tenantID, in.ManagementIP).Scan(&ipID, &assignedDevice)
 		switch {
 		case lookupErr == nil && assignedDevice != nil && *assignedDevice != deviceID:
 			err = fmt.Errorf("IP address is already assigned to another device")
@@ -196,10 +230,10 @@ func (s *Server) quickCreateDevice(w http.ResponseWriter, r *http.Request) {
 			_, err = tx.Exec(r.Context(), `update ip_addresses set device_id=$1,status='active',updated_at=now() where id=$2`, deviceID, ipID)
 		case errors.Is(lookupErr, pgx.ErrNoRows):
 			var networkID string
-			if err = tx.QueryRow(r.Context(), `select id from networks where prefix >>= $1::inet order by masklen(prefix) desc limit 1`, in.ManagementIP).Scan(&networkID); errors.Is(err, pgx.ErrNoRows) {
+			if err = tx.QueryRow(r.Context(), `select id from networks where tenant_id=$1 and prefix >>= $2::inet order by masklen(prefix) desc limit 1`, tenantID, in.ManagementIP).Scan(&networkID); errors.Is(err, pgx.ErrNoRows) {
 				err = fmt.Errorf("IP address does not belong to a documented network; create the network or continue without an IP")
 			} else if err == nil {
-				err = tx.QueryRow(r.Context(), `insert into ip_addresses(network_id,address,device_id,status,description) values($1,$2::inet,$3,'active','Management address') returning id`, networkID, in.ManagementIP, deviceID).Scan(&ipID)
+				err = tx.QueryRow(r.Context(), `insert into ip_addresses(tenant_id,network_id,address,device_id,status,description) values($1,$2,$3::inet,$4,'active','Management address') returning id`, tenantID, networkID, in.ManagementIP, deviceID).Scan(&ipID)
 			}
 		default:
 			err = lookupErr
@@ -262,13 +296,20 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	var u user
 	var hash string
-	err := s.db.QueryRow(r.Context(), "select id,name,email,role,password_hash from users where lower(email)=lower($1)", in.Email).Scan(&u.ID, &u.Name, &u.Email, &u.Role, &hash)
+	var assignedTenant *string
+	err := s.db.QueryRow(r.Context(), "select id,name,email,role::text,password_hash,tenant_id::text from users where lower(email)=lower($1)", in.Email).Scan(&u.ID, &u.Name, &u.Email, &u.Role, &hash, &assignedTenant)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(in.Password)) != nil {
 		fail(w, 401, "INVALID_CREDENTIALS", "Invalid email or password")
 		return
 	}
 	token := uuid.NewString()
-	_, err = s.db.Exec(r.Context(), "insert into sessions(id,user_id,expires_at) values($1,$2,now()+interval '7 days')", token, u.ID)
+	if assignedTenant != nil {
+		u.TenantID = *assignedTenant
+	} else if err = s.db.QueryRow(r.Context(), `select id from tenants order by created_at limit 1`).Scan(&u.TenantID); err != nil {
+		fail(w, 500, "TENANT_REQUIRED", "No tenant is available")
+		return
+	}
+	_, err = s.db.Exec(r.Context(), "insert into sessions(id,user_id,tenant_id,expires_at) values($1,$2,$3,now()+interval '7 days')", token, u.ID, u.TenantID)
 	if err != nil {
 		fail(w, 500, "SESSION_ERROR", "Could not create session")
 		return
@@ -291,26 +332,316 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		var u user
-		err = s.db.QueryRow(r.Context(), `select u.id,u.name,u.email,u.role from sessions s join users u on u.id=s.user_id where s.id=$1 and s.expires_at>now()`, c.Value).Scan(&u.ID, &u.Name, &u.Email, &u.Role)
+		var assignedTenant *string
+		err = s.db.QueryRow(r.Context(), `select u.id,u.name,u.email,u.role::text,s.tenant_id::text,u.tenant_id::text from sessions s join users u on u.id=s.user_id where s.id=$1 and s.expires_at>now()`, c.Value).Scan(&u.ID, &u.Name, &u.Email, &u.Role, &u.TenantID, &assignedTenant)
 		if err != nil {
 			fail(w, 401, "UNAUTHENTICATED", "Session expired")
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userKey, u)))
+		if u.Role != "superadmin" && (assignedTenant == nil || *assignedTenant != u.TenantID) {
+			fail(w, 403, "TENANT_FORBIDDEN", "Tenant access denied")
+			return
+		}
+		ctx := context.WithValue(r.Context(), userKey, u)
+		ctx = context.WithValue(ctx, tenantKey, u.TenantID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"data": r.Context().Value(userKey)})
 }
+func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
+	u := r.Context().Value(userKey).(user)
+	query := `select id,name,slug,created_at from tenants where id=$1 order by name`
+	args := []any{u.TenantID}
+	if u.Role == "superadmin" {
+		query = `select id,name,slug,created_at from tenants order by name`
+		args = nil
+	}
+	rows, err := s.db.Query(r.Context(), query, args...)
+	if err != nil {
+		fail(w, 500, "QUERY_FAILED", "Could not list tenants")
+		return
+	}
+	defer rows.Close()
+	type item struct {
+		ID        string    `json:"id"`
+		Name      string    `json:"name"`
+		Slug      string    `json:"slug"`
+		CreatedAt time.Time `json:"created_at"`
+	}
+	data := []item{}
+	for rows.Next() {
+		var v item
+		if err := rows.Scan(&v.ID, &v.Name, &v.Slug, &v.CreatedAt); err != nil {
+			fail(w, 500, "SCAN_FAILED", "Could not read tenants")
+			return
+		}
+		data = append(data, v)
+	}
+	respond(w, 200, map[string]any{"data": data})
+}
+func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
+		fail(w, 400, "INVALID_JSON", "Invalid request")
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.Slug = strings.ToLower(strings.TrimSpace(in.Slug))
+	if in.Name == "" || !tenantSlugPattern.MatchString(in.Slug) {
+		fail(w, 422, "INVALID_TENANT", "Name and a valid slug are required")
+		return
+	}
+	var id string
+	if err := s.db.QueryRow(r.Context(), `insert into tenants(name,slug) values($1,$2) returning id`, in.Name, in.Slug).Scan(&id); err != nil {
+		fail(w, 422, "TENANT_CREATE_FAILED", err.Error())
+		return
+	}
+	respond(w, 201, map[string]any{"data": map[string]string{"id": id}})
+}
+func (s *Server) switchTenant(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var exists bool
+	if err := s.db.QueryRow(r.Context(), `select exists(select 1 from tenants where id=$1)`, id).Scan(&exists); err != nil || !exists {
+		fail(w, 404, "TENANT_NOT_FOUND", "Tenant not found")
+		return
+	}
+	cookie, err := r.Cookie("atlas_session")
+	if err != nil {
+		fail(w, 401, "UNAUTHENTICATED", "Authentication required")
+		return
+	}
+	if _, err = s.db.Exec(r.Context(), `update sessions set tenant_id=$1 where id=$2`, id, cookie.Value); err != nil {
+		fail(w, 500, "TENANT_SWITCH_FAILED", "Could not switch tenant")
+		return
+	}
+	respond(w, 200, map[string]any{"data": map[string]string{"tenant_id": id}})
+}
+func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
+		fail(w, 400, "INVALID_JSON", "Invalid request")
+		return
+	}
+	if len(in.NewPassword) < 12 {
+		fail(w, 422, "WEAK_PASSWORD", "New password must have at least 12 characters")
+		return
+	}
+	u := r.Context().Value(userKey).(user)
+	var currentHash string
+	if err := s.db.QueryRow(r.Context(), `select password_hash from users where id=$1`, u.ID).Scan(&currentHash); err != nil || bcrypt.CompareHashAndPassword([]byte(currentHash), []byte(in.CurrentPassword)) != nil {
+		fail(w, 401, "INVALID_CURRENT_PASSWORD", "Current password is incorrect")
+		return
+	}
+	newHash, err := bcrypt.GenerateFromPassword([]byte(in.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		fail(w, 500, "PASSWORD_ERROR", "Could not secure password")
+		return
+	}
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		fail(w, 500, "TX_FAILED", "Could not change password")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	if _, err = tx.Exec(r.Context(), `update users set password_hash=$1,updated_at=now() where id=$2`, string(newHash), u.ID); err == nil {
+		if cookie, cookieErr := r.Cookie("atlas_session"); cookieErr == nil {
+			_, err = tx.Exec(r.Context(), `delete from sessions where user_id=$1 and id<>$2`, u.ID, cookie.Value)
+		} else {
+			_, err = tx.Exec(r.Context(), `delete from sessions where user_id=$1`, u.ID)
+		}
+	}
+	if err != nil {
+		fail(w, 500, "PASSWORD_CHANGE_FAILED", "Could not change password")
+		return
+	}
+	if err = tx.Commit(r.Context()); err != nil {
+		fail(w, 500, "COMMIT_FAILED", "Could not change password")
+		return
+	}
+	respond(w, 200, map[string]any{"data": map[string]bool{"ok": true}})
+}
 func (s *Server) writeRequired(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u := r.Context().Value(userKey).(user)
-		if u.Role == "viewer" {
+		if u.Role != "superadmin" && u.Role != "admin" {
 			fail(w, 403, "FORBIDDEN", "Read-only role")
 			return
 		}
 		next(w, r)
 	}
+}
+
+func (s *Server) superAdminRequired(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(userKey).(user).Role != "superadmin" {
+			fail(w, 403, "SUPERADMIN_REQUIRED", "Superadministrator access required")
+			return
+		}
+		next(w, r)
+	}
+}
+
+func validUserRole(role string) bool {
+	return role == "superadmin" || role == "admin" || role == "viewer"
+}
+
+func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(r.Context(), `select id,name,email,role::text,created_at,updated_at from users where tenant_id=$1 or role='superadmin' order by name`, r.Context().Value(tenantKey).(string))
+	if err != nil {
+		fail(w, 500, "QUERY_FAILED", "Could not list users")
+		return
+	}
+	defer rows.Close()
+	type item struct {
+		ID        string    `json:"id"`
+		Name      string    `json:"name"`
+		Email     string    `json:"email"`
+		Role      string    `json:"role"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+	data := []item{}
+	for rows.Next() {
+		var v item
+		if err := rows.Scan(&v.ID, &v.Name, &v.Email, &v.Role, &v.CreatedAt, &v.UpdatedAt); err != nil {
+			fail(w, 500, "SCAN_FAILED", "Could not read users")
+			return
+		}
+		data = append(data, v)
+	}
+	respond(w, 200, map[string]any{"data": data})
+}
+
+func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name     string `json:"name"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
+		fail(w, 400, "INVALID_JSON", "Invalid request")
+		return
+	}
+	if strings.TrimSpace(in.Name) == "" || !strings.Contains(in.Email, "@") || len(in.Password) < 12 || !validUserRole(in.Role) {
+		fail(w, 422, "INVALID_USER", "Name, valid email, role, and a 12-character password are required")
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
+	if err != nil {
+		fail(w, 500, "PASSWORD_ERROR", "Could not secure password")
+		return
+	}
+	var id string
+	var tenantID any = r.Context().Value(tenantKey).(string)
+	if in.Role == "superadmin" {
+		tenantID = nil
+	}
+	err = s.db.QueryRow(r.Context(), `insert into users(name,email,password_hash,role,tenant_id) values($1,lower($2),$3,$4,$5) returning id`, strings.TrimSpace(in.Name), strings.TrimSpace(in.Email), string(hash), in.Role, tenantID).Scan(&id)
+	if err != nil {
+		fail(w, 422, "USER_CREATE_FAILED", err.Error())
+		return
+	}
+	respond(w, 201, map[string]any{"data": map[string]string{"id": id}})
+}
+
+func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var in struct {
+		Name     string `json:"name"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		Role     string `json:"role"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
+		fail(w, 400, "INVALID_JSON", "Invalid request")
+		return
+	}
+	if strings.TrimSpace(in.Name) == "" || !strings.Contains(in.Email, "@") || !validUserRole(in.Role) {
+		fail(w, 422, "INVALID_USER", "Name, valid email, and role are required")
+		return
+	}
+	var currentRole string
+	if err := s.db.QueryRow(r.Context(), `select role::text from users where id=$1 and (tenant_id=$2 or role='superadmin')`, id, r.Context().Value(tenantKey).(string)).Scan(&currentRole); errors.Is(err, pgx.ErrNoRows) {
+		fail(w, 404, "USER_NOT_FOUND", "User not found")
+		return
+	} else if err != nil {
+		fail(w, 500, "QUERY_FAILED", "Could not read user")
+		return
+	}
+	if currentRole == "superadmin" && in.Role != "superadmin" {
+		var count int
+		_ = s.db.QueryRow(r.Context(), `select count(*) from users where role='superadmin'`).Scan(&count)
+		if count <= 1 {
+			fail(w, 409, "LAST_SUPERADMIN", "The last superadministrator cannot be demoted")
+			return
+		}
+	}
+	var newTenant any = r.Context().Value(tenantKey).(string)
+	if in.Role == "superadmin" {
+		newTenant = nil
+	}
+	if in.Password != "" {
+		if len(in.Password) < 12 {
+			fail(w, 422, "WEAK_PASSWORD", "Password must have at least 12 characters")
+			return
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
+		if err != nil {
+			fail(w, 500, "PASSWORD_ERROR", "Could not secure password")
+			return
+		}
+		_, err = s.db.Exec(r.Context(), `update users set name=$1,email=lower($2),role=$3,password_hash=$4,tenant_id=$5,updated_at=now() where id=$6`, strings.TrimSpace(in.Name), strings.TrimSpace(in.Email), in.Role, string(hash), newTenant, id)
+		if err != nil {
+			fail(w, 422, "USER_UPDATE_FAILED", err.Error())
+			return
+		}
+		_, _ = s.db.Exec(r.Context(), `delete from sessions where user_id=$1`, id)
+	} else {
+		if _, err := s.db.Exec(r.Context(), `update users set name=$1,email=lower($2),role=$3,tenant_id=$4,updated_at=now() where id=$5`, strings.TrimSpace(in.Name), strings.TrimSpace(in.Email), in.Role, newTenant, id); err != nil {
+			fail(w, 422, "USER_UPDATE_FAILED", err.Error())
+			return
+		}
+	}
+	respond(w, 200, map[string]any{"data": map[string]string{"id": id}})
+}
+
+func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	current := r.Context().Value(userKey).(user)
+	if id == current.ID {
+		fail(w, 409, "CANNOT_DELETE_SELF", "You cannot delete your own account")
+		return
+	}
+	var role string
+	if err := s.db.QueryRow(r.Context(), `select role::text from users where id=$1 and (tenant_id=$2 or role='superadmin')`, id, r.Context().Value(tenantKey).(string)).Scan(&role); errors.Is(err, pgx.ErrNoRows) {
+		fail(w, 404, "USER_NOT_FOUND", "User not found")
+		return
+	} else if err != nil {
+		fail(w, 500, "QUERY_FAILED", "Could not read user")
+		return
+	}
+	if role == "superadmin" {
+		var count int
+		_ = s.db.QueryRow(r.Context(), `select count(*) from users where role='superadmin'`).Scan(&count)
+		if count <= 1 {
+			fail(w, 409, "LAST_SUPERADMIN", "The last superadministrator cannot be deleted")
+			return
+		}
+	}
+	if _, err := s.db.Exec(r.Context(), `delete from users where id=$1`, id); err != nil {
+		fail(w, 409, "USER_DELETE_FAILED", err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 var tables = map[string]string{"sites": "sites", "rooms": "rooms", "racks": "racks", "manufacturers": "manufacturers", "device-models": "device_models", "devices": "devices", "ports": "device_ports", "connections": "cables", "networks": "networks", "ip-addresses": "ip_addresses", "vlans": "vlans"}
@@ -326,8 +657,8 @@ func (s *Server) list(resource string) http.HandlerFunc {
 		if page < 1 {
 			page = 1
 		}
-		q := fmt.Sprintf("select row_to_json(t) from (select * from %s order by created_at desc limit $1 offset $2) t", table)
-		rows, err := s.db.Query(r.Context(), q, size, (page-1)*size)
+		q := fmt.Sprintf("select row_to_json(t) from (select * from %s where tenant_id=$1 order by created_at desc limit $2 offset $3) t", table)
+		rows, err := s.db.Query(r.Context(), q, r.Context().Value(tenantKey).(string), size, (page-1)*size)
 		if err != nil {
 			fail(w, 500, "QUERY_FAILED", err.Error())
 			return
@@ -344,9 +675,9 @@ func (s *Server) list(resource string) http.HandlerFunc {
 }
 func (s *Server) get(resource string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		q := fmt.Sprintf("select row_to_json(t) from (select * from %s where id=$1) t", tables[resource])
+		q := fmt.Sprintf("select row_to_json(t) from (select * from %s where id=$1 and tenant_id=$2) t", tables[resource])
 		var v json.RawMessage
-		if err := s.db.QueryRow(r.Context(), q, chi.URLParam(r, "id")).Scan(&v); errors.Is(err, pgx.ErrNoRows) {
+		if err := s.db.QueryRow(r.Context(), q, chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string)).Scan(&v); errors.Is(err, pgx.ErrNoRows) {
 			fail(w, 404, "NOT_FOUND", strings.TrimSuffix(strings.ToUpper(resource), "S")+" not found")
 			return
 		} else if err != nil {
@@ -385,10 +716,11 @@ func (s *Server) create(resource string) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		cols := []string{}
-		vals := []any{}
-		marks := []string{}
-		i := 1
+		delete(in, "tenant_id")
+		cols := []string{"tenant_id"}
+		vals := []any{r.Context().Value(tenantKey).(string)}
+		marks := []string{"$1"}
+		i := 2
 		for k, v := range in {
 			if !safeColumn(k) {
 				fail(w, 400, "INVALID_FIELD", "Invalid field name")
@@ -399,7 +731,7 @@ func (s *Server) create(resource string) http.HandlerFunc {
 			marks = append(marks, fmt.Sprintf("$%d", i))
 			i++
 		}
-		if len(cols) == 0 {
+		if len(cols) == 1 {
 			fail(w, 400, "EMPTY_REQUEST", "At least one field is required")
 			return
 		}
@@ -418,6 +750,7 @@ func (s *Server) update(resource string) http.HandlerFunc {
 		if !ok {
 			return
 		}
+		delete(in, "tenant_id")
 		sets := []string{}
 		vals := []any{}
 		i := 1
@@ -434,8 +767,8 @@ func (s *Server) update(resource string) http.HandlerFunc {
 			fail(w, 400, "EMPTY_REQUEST", "At least one field is required")
 			return
 		}
-		vals = append(vals, chi.URLParam(r, "id"))
-		q := fmt.Sprintf("update %s set %s,updated_at=now() where id=$%d", tables[resource], strings.Join(sets, ","), i)
+		vals = append(vals, chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string))
+		q := fmt.Sprintf("update %s set %s,updated_at=now() where id=$%d and tenant_id=$%d", tables[resource], strings.Join(sets, ","), i, i+1)
 		tag, err := s.db.Exec(r.Context(), q, vals...)
 		if err != nil {
 			fail(w, 422, "VALIDATION_FAILED", err.Error())
@@ -450,7 +783,7 @@ func (s *Server) update(resource string) http.HandlerFunc {
 }
 func (s *Server) remove(resource string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tag, err := s.db.Exec(r.Context(), fmt.Sprintf("delete from %s where id=$1", tables[resource]), chi.URLParam(r, "id"))
+		tag, err := s.db.Exec(r.Context(), fmt.Sprintf("delete from %s where id=$1 and tenant_id=$2", tables[resource]), chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string))
 		if err != nil {
 			fail(w, 409, "DELETE_FAILED", err.Error())
 			return
@@ -463,7 +796,7 @@ func (s *Server) remove(resource string) http.HandlerFunc {
 	}
 }
 func (s *Server) devicePorts(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), "select row_to_json(p) from device_ports p where device_id=$1 order by name", chi.URLParam(r, "id"))
+	rows, err := s.db.Query(r.Context(), "select row_to_json(p) from device_ports p where device_id=$1 and tenant_id=$2 order by name", chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string))
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return
@@ -492,8 +825,14 @@ func (s *Server) bulkPorts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
+	tenantID := r.Context().Value(tenantKey).(string)
+	var allowed bool
+	if err = tx.QueryRow(r.Context(), `select exists(select 1 from devices where id=$1 and tenant_id=$2)`, chi.URLParam(r, "id"), tenantID).Scan(&allowed); err != nil || !allowed {
+		fail(w, 404, "DEVICE_NOT_FOUND", "Device not found")
+		return
+	}
 	for i := in.Start; i <= in.End; i++ {
-		_, err = tx.Exec(r.Context(), "insert into device_ports(device_id,name,type) values($1,$2,$3)", chi.URLParam(r, "id"), fmt.Sprintf("%s%d", in.Prefix, i), in.Type)
+		_, err = tx.Exec(r.Context(), "insert into device_ports(tenant_id,device_id,name,type) values($1,$2,$3,$4)", tenantID, chi.URLParam(r, "id"), fmt.Sprintf("%s%d", in.Prefix, i), in.Type)
 		if err != nil {
 			fail(w, 422, "PORT_CREATE_FAILED", err.Error())
 			return
@@ -504,7 +843,7 @@ func (s *Server) bulkPorts(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	var v json.RawMessage
-	err := s.db.QueryRow(r.Context(), `select json_build_object('sites',(select count(*) from sites),'racks',(select count(*) from racks),'devices',(select count(*) from devices),'active_devices',(select count(*) from devices where status='active'),'networks',(select count(*) from networks),'vlans',(select count(*) from vlans),'connections',(select count(*) from cables))`).Scan(&v)
+	err := s.db.QueryRow(r.Context(), `select json_build_object('sites',(select count(*) from sites where tenant_id=$1),'racks',(select count(*) from racks where tenant_id=$1),'devices',(select count(*) from devices where tenant_id=$1),'active_devices',(select count(*) from devices where tenant_id=$1 and status='active'),'networks',(select count(*) from networks where tenant_id=$1),'vlans',(select count(*) from vlans where tenant_id=$1),'connections',(select count(*) from cables where tenant_id=$1))`, r.Context().Value(tenantKey).(string)).Scan(&v)
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return
@@ -512,7 +851,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"data": v})
 }
 func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), `select c.id,da.id,da.name,da.device_type,coalesce(da.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=da.id),''),da.status::text,pa.name,db.id,db.name,db.device_type,coalesce(db.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=db.id),''),db.status::text,pb.name,c.cable_type,coalesce(c.label,'') from cables c join device_ports pa on pa.id=c.port_a_id join devices da on da.id=pa.device_id join device_ports pb on pb.id=c.port_b_id join devices db on db.id=pb.device_id`)
+	rows, err := s.db.Query(r.Context(), `select c.id,da.id,da.name,da.device_type,coalesce(da.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=da.id and i.tenant_id=$1),''),da.status::text,pa.name,db.id,db.name,db.device_type,coalesce(db.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=db.id and i.tenant_id=$1),''),db.status::text,pb.name,c.cable_type,coalesce(c.label,'') from cables c join device_ports pa on pa.id=c.port_a_id join devices da on da.id=pa.device_id join device_ports pb on pb.id=c.port_b_id join devices db on db.id=pb.device_id where c.tenant_id=$1 and pa.tenant_id=$1 and pb.tenant_id=$1 and da.tenant_id=$1 and db.tenant_id=$1`, r.Context().Value(tenantKey).(string))
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return
@@ -550,7 +889,8 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	q := "%" + r.URL.Query().Get("q") + "%"
-	rows, err := s.db.Query(r.Context(), `select kind,id,label,detail from (select 'device' kind,id,name label,coalesce(management_ip::text,'') detail from devices union all select 'site',id,name,description from sites union all select 'rack',id,name,description from racks union all select 'ip',i.id,i.address::text,coalesce(d.name,'') from ip_addresses i left join devices d on d.id=i.device_id) x where label ilike $1 or detail ilike $1 limit 25`, q)
+	tenantID := r.Context().Value(tenantKey).(string)
+	rows, err := s.db.Query(r.Context(), `select kind,id,label,detail from (select 'device' kind,id,name label,coalesce(management_ip::text,'') detail from devices where tenant_id=$2 union all select 'site',id,name,description from sites where tenant_id=$2 union all select 'rack',id,name,description from racks where tenant_id=$2 union all select 'ip',i.id,i.address::text,coalesce(d.name,'') from ip_addresses i left join devices d on d.id=i.device_id and d.tenant_id=$2 where i.tenant_id=$2) x where label ilike $1 or detail ilike $1 limit 25`, q, tenantID)
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return

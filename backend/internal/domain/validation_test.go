@@ -28,7 +28,7 @@ func TestVLAN(t *testing.T) {
 	}
 }
 func TestPermissions(t *testing.T) {
-	if CanWrite("viewer") || !CanWrite("operator") || CanManageUsers("operator") || !CanManageUsers("admin") {
+	if CanWrite("viewer") || !CanWrite("admin") || !CanWrite("superadmin") || CanManageUsers("admin") || !CanManageUsers("superadmin") {
 		t.Fatal("permission matrix invalid")
 	}
 }

@@ -32,5 +32,5 @@ func ValidateCable(a, b string, occupied map[string]bool) error {
 	return nil
 }
 
-func CanWrite(role string) bool       { return role == "admin" || role == "operator" }
-func CanManageUsers(role string) bool { return role == "admin" }
+func CanWrite(role string) bool       { return role == "superadmin" || role == "admin" }
+func CanManageUsers(role string) bool { return role == "superadmin" }
