@@ -1,0 +1,4 @@
+import type {Device} from '../lib/api';
+export const demoDevices:Device[]=[{id:'1',name:'ROUTER-EDGE',device_type:'router',management_ip:'10.10.0.1',status:'active',rack_position:42,rack_height:1},{id:'2',name:'SW-CORE-01',device_type:'switch',management_ip:'10.10.0.2',status:'active',rack_position:40,rack_height:1},{id:'3',name:'SW-ACCESS-01',device_type:'switch',management_ip:'10.10.0.3',status:'active',rack_position:38,rack_height:1},{id:'4',name:'PROXMOX-01',device_type:'server',management_ip:'10.10.0.10',status:'active',rack_position:29,rack_height:2},{id:'5',name:'OLT-01',device_type:'olt',management_ip:'10.10.0.20',status:'maintenance',rack_position:20,rack_height:2}];
+export const connections=[['ROUTER-EDGE','SFP1','SW-CORE-01','XGE0/0/1'],['SW-CORE-01','XGE0/0/2','SW-ACCESS-01','SFP1'],['SW-CORE-01','XGE0/0/4','PROXMOX-01','eno1']];
+

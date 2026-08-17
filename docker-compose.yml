@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tiiv_atlas}
+      POSTGRES_USER: ${POSTGRES_USER:-atlas}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-atlas_change_me}
+    volumes:
+      - atlas-postgres:/var/lib/postgresql/data
+      - ./backend/db/migrations/00001_init.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./backend/db/seed.sql:/docker-entrypoint-initdb.d/002-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-atlas} -d ${POSTGRES_DB:-tiiv_atlas}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  tiiv-atlas-api:
+    build: ./backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://atlas:atlas_change_me@postgres:5432/tiiv_atlas?sslmode=disable}
+      SESSION_SECRET: ${SESSION_SECRET:-development-only-secret-change-me}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      API_PORT: 8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  tiiv-atlas-web:
+    build: ./frontend
+    ports:
+      - "${WEB_PORT:-3000}:80"
+    depends_on:
+      tiiv-atlas-api:
+        condition: service_healthy
+volumes:
+  atlas-postgres:
+
