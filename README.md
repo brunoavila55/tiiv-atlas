@@ -104,7 +104,7 @@ Tiiv Atlas prevents deleting the current account and prevents deleting or demoti
 
 Sites, rooms, racks, devices, models, ports, connections, IPAM, VLANs, and tags belong to one organization. Every authenticated session carries an active organization, every resource query includes that organization, and PostgreSQL triggers reject foreign-key relationships across organizations. Tenant identifiers supplied by clients are ignored on create and update.
 
-Superadministrators are global and choose the active organization from **Organizations**. Administrators and viewers are permanently bound to their assigned organization and cannot switch context. User email addresses remain globally unique so one identity cannot ambiguously belong to multiple organizations.
+Superadministrators are global and land in the **Organizations** control center after signing in. From there they create or edit companies, review site/device/user totals, manage each company's users, and explicitly enter its isolated workspace. Administrators and viewers land directly in their assigned workspace and cannot switch context. User email addresses remain globally unique so one identity cannot ambiguously belong to multiple organizations.
 
 ## Screenshots
 

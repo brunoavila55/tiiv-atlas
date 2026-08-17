@@ -80,6 +80,7 @@ func New(db *pgxpool.Pool, log *slog.Logger, secure bool) http.Handler {
 			r.Get("/auth/me", s.me)
 			r.Get("/tenants", s.listTenants)
 			r.Post("/tenants", s.superAdminRequired(s.createTenant))
+			r.Put("/tenants/{id}", s.superAdminRequired(s.updateTenant))
 			r.Post("/tenants/{id}/switch", s.superAdminRequired(s.switchTenant))
 			r.Post("/auth/change-password", s.changePassword)
 			r.Get("/users", s.superAdminRequired(s.listUsers))
@@ -352,10 +353,18 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 	u := r.Context().Value(userKey).(user)
-	query := `select id,name,slug,created_at from tenants where id=$1 order by name`
+	query := `select t.id,t.name,t.slug,t.created_at,
+		(select count(*) from sites s where s.tenant_id=t.id),
+		(select count(*) from devices d where d.tenant_id=t.id),
+		(select count(*) from users x where x.tenant_id=t.id)
+		from tenants t where t.id=$1 order by t.name`
 	args := []any{u.TenantID}
 	if u.Role == "superadmin" {
-		query = `select id,name,slug,created_at from tenants order by name`
+		query = `select t.id,t.name,t.slug,t.created_at,
+			(select count(*) from sites s where s.tenant_id=t.id),
+			(select count(*) from devices d where d.tenant_id=t.id),
+			(select count(*) from users x where x.tenant_id=t.id)
+			from tenants t order by t.name`
 		args = nil
 	}
 	rows, err := s.db.Query(r.Context(), query, args...)
@@ -369,17 +378,53 @@ func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 		Name      string    `json:"name"`
 		Slug      string    `json:"slug"`
 		CreatedAt time.Time `json:"created_at"`
+		Sites     int64     `json:"sites"`
+		Devices   int64     `json:"devices"`
+		Users     int64     `json:"users"`
 	}
 	data := []item{}
 	for rows.Next() {
 		var v item
-		if err := rows.Scan(&v.ID, &v.Name, &v.Slug, &v.CreatedAt); err != nil {
+		if err := rows.Scan(&v.ID, &v.Name, &v.Slug, &v.CreatedAt, &v.Sites, &v.Devices, &v.Users); err != nil {
 			fail(w, 500, "SCAN_FAILED", "Could not read tenants")
 			return
 		}
 		data = append(data, v)
 	}
 	respond(w, 200, map[string]any{"data": data})
+}
+func (s *Server) updateTenant(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+		Slug string `json:"slug"`
+	}
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in) != nil {
+		fail(w, 400, "INVALID_JSON", "Invalid request")
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.Slug = strings.ToLower(strings.TrimSpace(in.Slug))
+	if in.Name == "" || !tenantSlugPattern.MatchString(in.Slug) {
+		fail(w, 422, "INVALID_TENANT", "Name and a valid slug are required")
+		return
+	}
+	id := chi.URLParam(r, "id")
+	var currentSlug string
+	if err := s.db.QueryRow(r.Context(), `select slug from tenants where id=$1`, id).Scan(&currentSlug); errors.Is(err, pgx.ErrNoRows) {
+		fail(w, 404, "TENANT_NOT_FOUND", "Organization not found")
+		return
+	} else if err != nil {
+		fail(w, 500, "QUERY_FAILED", "Could not read organization")
+		return
+	}
+	if currentSlug == "default" {
+		in.Slug = "default"
+	}
+	if _, err := s.db.Exec(r.Context(), `update tenants set name=$1,slug=$2,updated_at=now() where id=$3`, in.Name, in.Slug, id); err != nil {
+		fail(w, 422, "TENANT_UPDATE_FAILED", "Could not update organization")
+		return
+	}
+	respond(w, 200, map[string]any{"data": map[string]string{"id": id}})
 }
 func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 	var in struct {
