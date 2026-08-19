@@ -72,7 +72,7 @@ cd backend && DATABASE_URL='postgres://atlas:atlas_change_me@localhost:5432/tiiv
 cd frontend && pnpm install && pnpm dev
 ```
 
-The Vite server proxies API calls to port 8080. Useful targets include `make test`, `make build`, `make lint`, `make migrate`, and `make seed`.
+The Vite server proxies API calls to port 8080. Useful targets include `make test`, `make build`, `make lint`, `make seed` (re-applies `backend/db/seed.sql` against the running dev database; safe to run repeatedly), and `make migrate FILE=<name>.sql` (applies one new file from `backend/db/migrations` against the running dev database — pass only a file you have not applied yet; migrations are append-only, so replaying an old one against data it already migrated is not safe). `make dev`, `make migrate`, and `make seed` fall back to `podman compose` automatically when the `docker` binary isn't present, so the same commands work on a local Podman setup.
 
 ## Configuration
 
@@ -88,13 +88,15 @@ The Vite server proxies API calls to port 8080. Useful targets include `make tes
 
 ## Database and sqlc
 
-The baseline migration is in `backend/db/migrations`, seed data is in `backend/db/seed.sql`, and typed-query sources are in `backend/db/queries`. Run `sqlc generate` from `backend` after changing query definitions. Add new numbered migrations instead of editing a production-applied migration.
+The baseline migration is in `backend/db/migrations`, seed data is in `backend/db/seed.sql`, and typed-query sources are in `backend/db/queries`. `sqlc.yaml` reads the whole `backend/db/migrations` directory as schema, so generated code always reflects every applied migration, not just the baseline. Run `sqlc generate` from `backend` after changing query definitions. Add new numbered migrations instead of editing a production-applied migration.
+
+Migration `00010_fix_upsert_trigger_self_conflict.sql` switches the `devices_rack_collision` and `cable_ports_unique` triggers from `BEFORE` to `AFTER`. Postgres fires a `BEFORE INSERT` trigger against a row's proposed identity before `ON CONFLICT` resolves it, so every upsert (including re-running `seed.sql`) was falsely rejected as colliding with itself; genuine rack overlaps and duplicate port cabling are still rejected after the fix.
 
 ## API overview
 
 All application routes are under `/api/v1`. Resources include sites, rooms, racks, manufacturers, device models, devices, ports, connections, networks, IP addresses, and VLANs. The API also exposes `/dashboard`, `/topology`, `/search?q=`, and authentication routes. Responses use `{ "data": ... }`; errors use `{ "error": { "code", "message" } }`. `GET /health` checks API and database readiness.
 
-List endpoints accept `page` and `page_size` (up to 100). The device and network screens are structured to add more server-side filters without a global client store.
+List endpoints accept `page` and `page_size` (up to 100) and return a `meta.total` row count for the active organization alongside `meta.page`/`meta.page_size`, so clients can build page controls without a separate count query. The device and network screens are structured to add more server-side filters without a global client store.
 
 ## Security notes
 
@@ -111,6 +113,8 @@ Tiiv Atlas prevents deleting the current account and prevents deleting or demoti
 ### Multitenancy
 
 Sites, rooms, racks, devices, models, ports, connections, IPAM, VLANs, and tags belong to one organization. Every authenticated session carries an active organization, every resource query includes that organization, and PostgreSQL triggers reject foreign-key relationships across organizations. Tenant identifiers supplied by clients are ignored on create and update.
+
+As a database-level backstop to that application-level filtering, migration `00009_row_level_security.sql` enables Postgres row-level security on every CMDB/infrastructure table. Each request to those tables runs on a dedicated connection with `app.tenant_id` pinned to the caller's active organization (see `internal/server.tenantScope`), so a query that ever omitted its own tenant filter would still be blocked by Postgres rather than returning or accepting another organization's rows. The `tenants`, `users`, and `sessions` tables are intentionally not covered, since login and superadministrator flows need legitimate cross-tenant lookups.
 
 Superadministrators are global and land in the **Organizations** control center after signing in. From there they create or edit companies, review site/device/user totals, manage each company's users, and explicitly enter its isolated workspace. Administrators and viewers land directly in their assigned workspace and cannot switch context. User email addresses remain globally unique so one identity cannot ambiguously belong to multiple organizations.
 
