@@ -20,6 +20,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -67,6 +68,58 @@ type ctxKey string
 
 const userKey ctxKey = "user"
 const tenantKey ctxKey = "tenant"
+const connKey ctxKey = "conn"
+
+// querier is satisfied by both *pgxpool.Pool and *pgxpool.Conn, so request handlers
+// can be handed either a pool-wide connection (administrative/tenant/user tables,
+// which are not tenant-partitioned) or a per-request connection that has
+// app.tenant_id set for the caller's active tenant (CMDB/infrastructure tables,
+// which carry a database-enforced row-level-security policy keyed on that setting).
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// q returns the request-scoped, tenant-pinned database connection set up by
+// tenantScope for CMDB/infrastructure handlers. Handlers that operate on
+// tenants/users/sessions (which are not covered by row-level security) should
+// keep using s.db directly.
+func (s *Server) q(r *http.Request) querier {
+	if c, ok := r.Context().Value(connKey).(*pgxpool.Conn); ok {
+		return c
+	}
+	return s.db
+}
+
+// tenantScope acquires a dedicated connection from the pool for the lifetime of
+// the request and pins Postgres's app.tenant_id session setting to the caller's
+// active tenant on it. This is the runtime half of the tenant_isolation row-level
+// security policies added in migration 00009: even if a handler's own SQL forgets
+// a "where tenant_id = ..." clause, Postgres itself will refuse to read or write
+// rows belonging to a different tenant on this connection. It is a backstop, not
+// a replacement, for the explicit tenant filtering already present in each query.
+func (s *Server) tenantScope(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tenantID, _ := r.Context().Value(tenantKey).(string)
+		if tenantID == "" {
+			fail(w, 403, "TENANT_REQUIRED", "No active tenant for this session")
+			return
+		}
+		conn, err := s.db.Acquire(r.Context())
+		if err != nil {
+			fail(w, 503, "DATABASE_UNAVAILABLE", "Could not reach the database")
+			return
+		}
+		defer conn.Release()
+		if _, err := conn.Exec(r.Context(), `select set_config('app.tenant_id', $1, false)`, tenantID); err != nil {
+			fail(w, 503, "DATABASE_UNAVAILABLE", "Could not scope the database session")
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), connKey, conn)))
+	})
+}
 
 type user struct {
 	ID         string `json:"id"`
@@ -110,20 +163,27 @@ func New(db *pgxpool.Pool, log *slog.Logger, secure bool) http.Handler {
 			r.Post("/users", s.superAdminRequired(s.createUser))
 			r.Put("/users/{id}", s.superAdminRequired(s.updateUser))
 			r.Delete("/users/{id}", s.superAdminRequired(s.deleteUser))
-			r.Get("/dashboard", s.dashboard)
-			r.Get("/topology", s.topology)
-			r.Get("/search", s.search)
-			for _, resource := range []string{"sites", "rooms", "racks", "manufacturers", "device-models", "devices", "ports", "connections", "networks", "ip-addresses", "vlans"} {
-				res := resource
-				r.Get("/"+res, s.list(res))
-				r.Post("/"+res, s.writeRequired(s.create(res)))
-				r.Get("/"+res+"/{id}", s.get(res))
-				r.Put("/"+res+"/{id}", s.writeRequired(s.update(res)))
-				r.Delete("/"+res+"/{id}", s.writeRequired(s.remove(res)))
-			}
-			r.Get("/devices/{id}/ports", s.devicePorts)
-			r.Post("/devices/{id}/ports/bulk", s.writeRequired(s.bulkPorts))
-			r.Post("/devices/quick-create", s.writeRequired(s.quickCreateDevice))
+			// CMDB/infrastructure routes get their own request-scoped, tenant-pinned
+			// connection (see tenantScope) so the row-level security policies added in
+			// migration 00009 back up the manual "where tenant_id = ..." filtering
+			// already present in every one of these handlers.
+			r.Group(func(r chi.Router) {
+				r.Use(s.tenantScope)
+				r.Get("/dashboard", s.dashboard)
+				r.Get("/topology", s.topology)
+				r.Get("/search", s.search)
+				for _, resource := range []string{"sites", "rooms", "racks", "manufacturers", "device-models", "devices", "ports", "connections", "networks", "ip-addresses", "vlans"} {
+					res := resource
+					r.Get("/"+res, s.list(res))
+					r.Post("/"+res, s.writeRequired(s.create(res)))
+					r.Get("/"+res+"/{id}", s.get(res))
+					r.Put("/"+res+"/{id}", s.writeRequired(s.update(res)))
+					r.Delete("/"+res+"/{id}", s.writeRequired(s.remove(res)))
+				}
+				r.Get("/devices/{id}/ports", s.devicePorts)
+				r.Post("/devices/{id}/ports/bulk", s.writeRequired(s.bulkPorts))
+				r.Post("/devices/quick-create", s.writeRequired(s.quickCreateDevice))
+			})
 		})
 	})
 	return r
@@ -179,7 +239,7 @@ func (s *Server) quickCreateDevice(w http.ResponseWriter, r *http.Request) {
 	if in.Status == "" {
 		in.Status = "active"
 	}
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.q(r).Begin(r.Context())
 	if err != nil {
 		fail(w, 500, "TX_FAILED", "Could not start installation")
 		return
@@ -1016,6 +1076,12 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 
 var tables = map[string]string{"sites": "sites", "rooms": "rooms", "racks": "racks", "manufacturers": "manufacturers", "device-models": "device_models", "devices": "devices", "ports": "device_ports", "connections": "cables", "networks": "networks", "ip-addresses": "ip_addresses", "vlans": "vlans"}
 
+// inetColumns lists the inet-typed columns reachable through the generic
+// create/update handlers. Postgres rejects an empty string cast to inet, so a
+// bare "management_ip":"" from a client (the natural way to say "clear this
+// field") would otherwise fail with a 422 instead of nulling the column out.
+var inetColumns = map[string]bool{"management_ip": true, "gateway": true}
+
 func (s *Server) list(resource string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		table := tables[resource]
@@ -1027,8 +1093,14 @@ func (s *Server) list(resource string) http.HandlerFunc {
 		if page < 1 {
 			page = 1
 		}
+		tenantID := r.Context().Value(tenantKey).(string)
+		var total int
+		if err := s.q(r).QueryRow(r.Context(), fmt.Sprintf("select count(*) from %s where tenant_id=$1", table), tenantID).Scan(&total); err != nil {
+			fail(w, 500, "QUERY_FAILED", err.Error())
+			return
+		}
 		q := fmt.Sprintf("select row_to_json(t) from (select * from %s where tenant_id=$1 order by created_at desc limit $2 offset $3) t", table)
-		rows, err := s.db.Query(r.Context(), q, r.Context().Value(tenantKey).(string), size, (page-1)*size)
+		rows, err := s.q(r).Query(r.Context(), q, tenantID, size, (page-1)*size)
 		if err != nil {
 			fail(w, 500, "QUERY_FAILED", err.Error())
 			return
@@ -1040,14 +1112,14 @@ func (s *Server) list(resource string) http.HandlerFunc {
 			_ = rows.Scan(&v)
 			data = append(data, v)
 		}
-		respond(w, 200, map[string]any{"data": data, "meta": map[string]int{"page": page, "page_size": size}})
+		respond(w, 200, map[string]any{"data": data, "meta": map[string]int{"page": page, "page_size": size, "total": total}})
 	}
 }
 func (s *Server) get(resource string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := fmt.Sprintf("select row_to_json(t) from (select * from %s where id=$1 and tenant_id=$2) t", tables[resource])
 		var v json.RawMessage
-		if err := s.db.QueryRow(r.Context(), q, chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string)).Scan(&v); errors.Is(err, pgx.ErrNoRows) {
+		if err := s.q(r).QueryRow(r.Context(), q, chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string)).Scan(&v); errors.Is(err, pgx.ErrNoRows) {
 			fail(w, 404, "NOT_FOUND", strings.TrimSuffix(strings.ToUpper(resource), "S")+" not found")
 			return
 		} else if err != nil {
@@ -1107,7 +1179,7 @@ func (s *Server) create(resource string) http.HandlerFunc {
 		}
 		q := fmt.Sprintf("insert into %s(%s) values(%s) returning id", tables[resource], strings.Join(cols, ","), strings.Join(marks, ","))
 		var id string
-		if err := s.db.QueryRow(r.Context(), q, vals...).Scan(&id); err != nil {
+		if err := s.q(r).QueryRow(r.Context(), q, vals...).Scan(&id); err != nil {
 			fail(w, 422, "VALIDATION_FAILED", err.Error())
 			return
 		}
@@ -1129,6 +1201,15 @@ func (s *Server) update(resource string) http.HandlerFunc {
 				fail(w, 400, "INVALID_FIELD", "Invalid field name")
 				return
 			}
+			// inet columns (management_ip, gateway) reject an empty-string bind
+			// with a Postgres cast error. The frontend sends "" to mean "clear
+			// this field", so translate that to a real SQL NULL here — a nil
+			// bind is valid for any column type, including inet.
+			if inetColumns[k] {
+				if sv, ok := v.(string); ok && sv == "" {
+					v = nil
+				}
+			}
 			sets = append(sets, fmt.Sprintf("%s=$%d", k, i))
 			vals = append(vals, v)
 			i++
@@ -1139,7 +1220,7 @@ func (s *Server) update(resource string) http.HandlerFunc {
 		}
 		vals = append(vals, chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string))
 		q := fmt.Sprintf("update %s set %s,updated_at=now() where id=$%d and tenant_id=$%d", tables[resource], strings.Join(sets, ","), i, i+1)
-		tag, err := s.db.Exec(r.Context(), q, vals...)
+		tag, err := s.q(r).Exec(r.Context(), q, vals...)
 		if err != nil {
 			fail(w, 422, "VALIDATION_FAILED", err.Error())
 			return
@@ -1153,7 +1234,7 @@ func (s *Server) update(resource string) http.HandlerFunc {
 }
 func (s *Server) remove(resource string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		tag, err := s.db.Exec(r.Context(), fmt.Sprintf("delete from %s where id=$1 and tenant_id=$2", tables[resource]), chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string))
+		tag, err := s.q(r).Exec(r.Context(), fmt.Sprintf("delete from %s where id=$1 and tenant_id=$2", tables[resource]), chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string))
 		if err != nil {
 			fail(w, 409, "DELETE_FAILED", err.Error())
 			return
@@ -1166,7 +1247,7 @@ func (s *Server) remove(resource string) http.HandlerFunc {
 	}
 }
 func (s *Server) devicePorts(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), "select row_to_json(p) from device_ports p where device_id=$1 and tenant_id=$2 order by name", chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string))
+	rows, err := s.q(r).Query(r.Context(), "select row_to_json(p) from device_ports p where device_id=$1 and tenant_id=$2 order by name", chi.URLParam(r, "id"), r.Context().Value(tenantKey).(string))
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return
@@ -1189,7 +1270,7 @@ func (s *Server) bulkPorts(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "INVALID_RANGE", "Invalid port range")
 		return
 	}
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.q(r).Begin(r.Context())
 	if err != nil {
 		fail(w, 500, "TX_FAILED", err.Error())
 		return
@@ -1213,7 +1294,7 @@ func (s *Server) bulkPorts(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	var v json.RawMessage
-	err := s.db.QueryRow(r.Context(), `select json_build_object('sites',(select count(*) from sites where tenant_id=$1),'racks',(select count(*) from racks where tenant_id=$1),'devices',(select count(*) from devices where tenant_id=$1),'active_devices',(select count(*) from devices where tenant_id=$1 and status='active'),'networks',(select count(*) from networks where tenant_id=$1),'vlans',(select count(*) from vlans where tenant_id=$1),'connections',(select count(*) from cables where tenant_id=$1))`, r.Context().Value(tenantKey).(string)).Scan(&v)
+	err := s.q(r).QueryRow(r.Context(), `select json_build_object('sites',(select count(*) from sites where tenant_id=$1),'racks',(select count(*) from racks where tenant_id=$1),'devices',(select count(*) from devices where tenant_id=$1),'active_devices',(select count(*) from devices where tenant_id=$1 and status='active'),'networks',(select count(*) from networks where tenant_id=$1),'vlans',(select count(*) from vlans where tenant_id=$1),'connections',(select count(*) from cables where tenant_id=$1))`, r.Context().Value(tenantKey).(string)).Scan(&v)
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return
@@ -1221,7 +1302,7 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"data": v})
 }
 func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), `select c.id,da.id,da.name,da.device_type,coalesce(da.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=da.id and i.tenant_id=$1),''),da.status::text,pa.name,db.id,db.name,db.device_type,coalesce(db.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=db.id and i.tenant_id=$1),''),db.status::text,pb.name,c.cable_type,coalesce(c.label,'') from cables c join device_ports pa on pa.id=c.port_a_id join devices da on da.id=pa.device_id join device_ports pb on pb.id=c.port_b_id join devices db on db.id=pb.device_id where c.tenant_id=$1 and pa.tenant_id=$1 and pb.tenant_id=$1 and da.tenant_id=$1 and db.tenant_id=$1`, r.Context().Value(tenantKey).(string))
+	rows, err := s.q(r).Query(r.Context(), `select c.id,da.id,da.name,da.device_type,coalesce(da.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=da.id and i.tenant_id=$1),''),da.status::text,pa.name,db.id,db.name,db.device_type,coalesce(db.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=db.id and i.tenant_id=$1),''),db.status::text,pb.name,c.cable_type,coalesce(c.label,'') from cables c join device_ports pa on pa.id=c.port_a_id join devices da on da.id=pa.device_id join device_ports pb on pb.id=c.port_b_id join devices db on db.id=pb.device_id where c.tenant_id=$1 and pa.tenant_id=$1 and pb.tenant_id=$1 and da.tenant_id=$1 and db.tenant_id=$1`, r.Context().Value(tenantKey).(string))
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return
@@ -1260,7 +1341,7 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	q := "%" + r.URL.Query().Get("q") + "%"
 	tenantID := r.Context().Value(tenantKey).(string)
-	rows, err := s.db.Query(r.Context(), `select kind,id,label,detail from (select 'device' kind,id,name label,coalesce(management_ip::text,'') detail from devices where tenant_id=$2 union all select 'site',id,name,description from sites where tenant_id=$2 union all select 'rack',id,name,description from racks where tenant_id=$2 union all select 'ip',i.id,i.address::text,coalesce(d.name,'') from ip_addresses i left join devices d on d.id=i.device_id and d.tenant_id=$2 where i.tenant_id=$2) x where label ilike $1 or detail ilike $1 limit 25`, q, tenantID)
+	rows, err := s.q(r).Query(r.Context(), `select kind,id,label,detail from (select 'device' kind,id,name label,coalesce(management_ip::text,'') detail from devices where tenant_id=$2 union all select 'site',id,name,description from sites where tenant_id=$2 union all select 'rack',id,name,description from racks where tenant_id=$2 union all select 'ip',i.id,i.address::text,coalesce(d.name,'') from ip_addresses i left join devices d on d.id=i.device_id and d.tenant_id=$2 where i.tenant_id=$2) x where label ilike $1 or detail ilike $1 limit 25`, q, tenantID)
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return

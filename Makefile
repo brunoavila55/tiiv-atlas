@@ -1,6 +1,10 @@
 .PHONY: dev build test migrate migrate-down seed lint
 dev:
-	docker compose up --build
+	@if command -v docker >/dev/null 2>&1; then \
+		docker compose -f docker-compose.dev.yml up --build; \
+	else \
+		podman compose -f docker-compose.dev.yml up --build; \
+	fi
 build:
 	docker compose build
 test:
@@ -15,4 +19,3 @@ seed:
 lint:
 	cd backend && go vet ./...
 	cd frontend && pnpm lint
-

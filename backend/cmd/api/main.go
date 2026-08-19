@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/tiiv/atlas/backend/internal/server"
 )
@@ -15,7 +16,20 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	db, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	poolConfig, err := pgxpool.ParseConfig(os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Error("database configuration failed", "error", err)
+		os.Exit(1)
+	}
+	// Request handlers pin a per-request connection's app.tenant_id session setting
+	// to enforce the row-level security policies from migration 00009 (see
+	// internal/server.tenantScope). Clear that setting before a connection goes
+	// back into the idle pool so a later, unrelated request never inherits it.
+	poolConfig.AfterRelease = func(c *pgx.Conn) bool {
+		_, _ = c.Exec(context.Background(), `select set_config('app.tenant_id', '', false)`)
+		return true
+	}
+	db, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		log.Error("database configuration failed", "error", err)
 		os.Exit(1)
