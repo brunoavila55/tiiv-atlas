@@ -35,3 +35,13 @@ func TestCanonicalHostnameIPv6(t *testing.T) {
 		t.Fatalf("canonicalHostname() = %q, want ::1", got)
 	}
 }
+
+func TestPortalURLPreservesPublicPort(t *testing.T) {
+	s := &Server{baseDomain: "atlas.newlifefibra.com.br"}
+	if got, want := s.portalURL("fibra", "atlas.newlifefibra.com.br:15467"), "http://fibra.atlas.newlifefibra.com.br:15467"; got != want {
+		t.Fatalf("portalURL() = %q, want %q", got, want)
+	}
+	if got, want := s.portalURL("fibra", "atlas.newlifefibra.com.br"), "http://fibra.atlas.newlifefibra.com.br"; got != want {
+		t.Fatalf("portalURL() = %q, want %q", got, want)
+	}
+}

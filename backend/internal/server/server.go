@@ -430,7 +430,7 @@ func (s *Server) resolvePortal(ctx context.Context, host string) (portalScope, e
 	return scope, nil
 }
 
-func (s *Server) portalURL(slug string) string {
+func (s *Server) portalURL(slug, requestHost string) string {
 	if s.baseDomain == "" {
 		return ""
 	}
@@ -438,7 +438,14 @@ func (s *Server) portalURL(slug string) string {
 	if s.secure {
 		scheme = "https"
 	}
-	return scheme + "://" + slug + "." + s.baseDomain
+	host := slug + "." + s.baseDomain
+	// APP_BASE_DOMAIN intentionally stores only the hostname. When Atlas is
+	// published on a non-standard port, preserve the port from the validated
+	// request host so organization links still point at the running service.
+	if _, port, err := net.SplitHostPort(requestHost); err == nil && port != "" {
+		host = net.JoinHostPort(host, port)
+	}
+	return scheme + "://" + host
 }
 
 func (s *Server) portalInfo(w http.ResponseWriter, r *http.Request) {
@@ -658,7 +665,7 @@ func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, "SCAN_FAILED", "Could not read tenants")
 			return
 		}
-		v.URL = s.portalURL(v.Slug)
+		v.URL = s.portalURL(v.Slug, r.Host)
 		if v.HasLogo {
 			v.LogoURL = fmt.Sprintf("/api/v1/tenants/%s/branding/logo?v=%d", v.ID, v.UpdatedAt.UnixNano())
 		}
