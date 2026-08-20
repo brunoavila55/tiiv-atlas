@@ -32,9 +32,10 @@ function Shell({me,portal}:{me:SessionUser;portal:PortalInfo}){
   const [activeTenant,setActiveTenant]=useState('Organization workspace');
   const nav=useNavigate();
   const location=useLocation();
+  const isMaster=me.role==='master';
   const isSuper=me.role==='superadmin';
-  const canManageUsers=isSuper||me.role==='admin';
-  const isGlobalSuper=isSuper&&me.portal!=='tenant';
+  const canManageUsers=isMaster||isSuper||me.role==='admin';
+  const isGlobalSuper=isMaster&&me.portal!=='tenant';
   const controlMode=isGlobalSuper&&['/','/tenants','/users'].includes(location.pathname);
   const groups=controlMode?controlGroups:workspaceGroups;
   const productName=portal.kind==='tenant'?(portal.brand_name||portal.tenant_name):'Tiiv Atlas';
@@ -54,7 +55,7 @@ function Shell({me,portal}:{me:SessionUser;portal:PortalInfo}){
     <aside className={open?'sidebar open':'sidebar'}>
       <div className="brand">{portal.kind==='tenant'&&portal.logo_url?<img src={portal.logo_url} alt={productName}/>:<span>T</span>}<div>{productName}<small>{controlMode?'Superadmin Control Center':'Infrastructure Management'}</small></div><button className="mobile-close" onClick={()=>setOpen(false)}><X/></button></div>
       <nav>{groups.map(group=><section key={group.name}><label>{group.name}</label>{group.items.filter(([,path])=>path==='/tenants'?isGlobalSuper:path==='/users'?canManageUsers:true).map(([name,path,Icon])=><NavLink key={path} to={path} onClick={()=>setOpen(false)} className={({isActive})=>isActive?'active':''}><Icon size={17}/>{name}</NavLink>)}</section>)}</nav>
-      {isSuper&&<div className="super-context"><small>{controlMode?'Active organization':'Working in'}</small><strong>{me.tenant_name||activeTenant}</strong>{controlMode?<NavLink to="/dashboard">Open workspace</NavLink>:me.base_domain?<a href={window.location.protocol+'//'+me.base_domain+(window.location.port?':'+window.location.port:'')}>Back to control center</a>:<NavLink to="/tenants">Back to control center</NavLink>}</div>}
+      {isMaster&&<div className="super-context"><small>{controlMode?'Active organization':'Working in'}</small><strong>{me.tenant_name||activeTenant}</strong>{controlMode?<NavLink to="/dashboard">Open workspace</NavLink>:me.base_domain?<a href={window.location.protocol+'//'+me.base_domain+(window.location.port?':'+window.location.port:'')}>Back to control center</a>:<NavLink to="/tenants">Back to control center</NavLink>}</div>}
       <AccountMenu me={me}/>
     </aside>
     <main><header><button className="menu" onClick={()=>setOpen(true)}><Menu/></button>{controlMode?<div className="control-title"><Building2/><div><strong>Superadmin</strong><small>Organizations and access management</small></div></div>:<div className="global-search"><Search size={17}/><input aria-label="Global search" placeholder="Search devices, IPs, racks…" onKeyDown={event=>{if(event.key==='Enter')nav('/devices?q='+encodeURIComponent(event.currentTarget.value))}}/><kbd>⌘ K</kbd></div>}<button className="theme" onClick={()=>setDark(!dark)}>{dark?<Sun/>:<Moon/>}</button></header>
