@@ -45,13 +45,15 @@ The production stack publishes only the web gateway on port `15467` by default. 
 docker compose up -d --build
 ```
 
-Configure Nginx Proxy Manager with scheme `http`, the VM's LAN address as the forward hostname, and port `15467`. TLS terminates at Nginx Proxy Manager. Change `WEB_PORT` in `.env` if another host port is required; use a firewall to restrict direct access to that port when appropriate.
+Atlas does not require a specific reverse proxy. Point Nginx Proxy Manager, Nginx, Traefik, Caddy, HAProxy, a tunnel, or a load balancer to the host running Atlas on port `15467` using HTTP. Preserve the original `Host` header and the standard `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto` headers. Change `WEB_PORT` in `.env` if another host port is required; use `WEB_BIND=127.0.0.1` when the proxy runs on the same host, or a firewall when the gateway must listen on the LAN.
+
+Direct HTTP access works with the defaults. When TLS terminates at a reverse proxy, set `COOKIE_SECURE=true` so session cookies are sent only over HTTPS.
 
 ### Tenant subdomains
 
-Set `APP_BASE_DOMAIN=atlas.tiiv.com.br` to enable host-based tenant portals. The base address `https://atlas.tiiv.com.br` becomes the global superadministrator control center. Each organization slug becomes its portal hostname, so the `newlife` slug is available at `https://newlife.atlas.tiiv.com.br`. Login and every authenticated API request verify that the hostname matches the user's organization; an unknown or mismatched subdomain is rejected.
+`APP_BASE_DOMAIN` is empty by default, so Atlas accepts any hostname and does not depend on a particular DNS or proxy setup. Set it to a hostname such as `atlas.example.com` only when host-based tenant portals are wanted. The base address becomes the global superadministrator control center and each organization slug becomes a portal such as `newlife.atlas.example.com`. Login and every authenticated API request then verify that the hostname matches the user's organization; an unknown or mismatched subdomain is rejected.
 
-Create DNS records for both `atlas.tiiv.com.br` and `*.atlas.tiiv.com.br` pointing to the Nginx Proxy Manager address. In Nginx Proxy Manager, create one Proxy Host containing both names, forward it with scheme `http` to the VM LAN address on port `15467`, and attach a certificate covering the base and wildcard names. Wildcard Let's Encrypt certificates require a supported DNS challenge. No tenant-specific containers or proxy entries are required after the wildcard is configured.
+For tenant subdomains, create DNS records for the base hostname and its wildcard, point both at the chosen reverse proxy, and use a certificate covering both names. Wildcard Let's Encrypt certificates normally require a supported DNS challenge. A single wildcard proxy route is sufficient; tenant-specific containers or proxy entries are not required.
 
 Back up the `atlas-postgres` volume regularly. The named `atlas-postgres` volume persists data, and every file in `backend/db/migrations` runs automatically, in order, only when that volume is first created (a brand new production database). For an existing installation, take a backup and then run `make migrate`: it tracks which migration files have already run in a `schema_migrations` table and applies only the ones that haven't, in filename order, so it's safe to run after every upgrade regardless of how far behind the installation is.
 
@@ -72,8 +74,8 @@ The Vite server proxies API calls to port 8080. Useful targets include `make tes
 |---|---|---|
 | `DATABASE_URL` | PostgreSQL connection URL | Compose service URL |
 | `SESSION_SECRET` | Reserved for session-key rotation | development value |
-| `COOKIE_SECURE` | Require HTTPS for cookies | `false` |
-| `APP_BASE_DOMAIN` | Base hostname used for the superadmin portal and tenant subdomains; empty disables hostname enforcement | empty outside production Compose |
+| `COOKIE_SECURE` | Require HTTPS for cookies; enable when TLS terminates at a reverse proxy | `false` |
+| `APP_BASE_DOMAIN` | Optional base hostname for the superadmin portal and tenant subdomains; empty disables hostname enforcement | empty |
 | `API_PORT` | API listen port | `8080` |
 | `WEB_BIND` | Interface used by the production web gateway | `0.0.0.0` |
 | `WEB_PORT` | Published web port (`3000` in development Compose) | `15467` in production |

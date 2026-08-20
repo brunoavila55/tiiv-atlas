@@ -24,8 +24,8 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
-      COOKIE_SECURE: "true"
-      APP_BASE_DOMAIN: ${APP_BASE_DOMAIN:-atlas.tiiv.com.br}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      APP_BASE_DOMAIN: ${APP_BASE_DOMAIN:-}
       API_PORT: 8080
       ADMIN_NAME: ${ADMIN_NAME:-Atlas Administrator}
       ADMIN_EMAIL: ${ADMIN_EMAIL:?ADMIN_EMAIL is required}
