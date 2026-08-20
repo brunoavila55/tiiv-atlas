@@ -160,10 +160,10 @@ func New(db *pgxpool.Pool, log *slog.Logger, secure bool) http.Handler {
 			r.Get("/tenants/{id}/branding/{asset}", s.superAdminGlobalRequired(s.tenantBrandingAsset))
 			r.Delete("/tenants/{id}/branding/{asset}", s.superAdminGlobalRequired(s.deleteTenantBrandingAsset))
 			r.Post("/auth/change-password", s.changePassword)
-			r.Get("/users", s.superAdminRequired(s.listUsers))
-			r.Post("/users", s.superAdminRequired(s.createUser))
-			r.Put("/users/{id}", s.superAdminRequired(s.updateUser))
-			r.Delete("/users/{id}", s.superAdminRequired(s.deleteUser))
+			r.Get("/users", s.userManagementRequired(s.listUsers))
+			r.Post("/users", s.userManagementRequired(s.createUser))
+			r.Put("/users/{id}", s.userManagementRequired(s.updateUser))
+			r.Delete("/users/{id}", s.userManagementRequired(s.deleteUser))
 			// CMDB/infrastructure routes get their own request-scoped, tenant-pinned
 			// connection (see tenantScope) so the row-level security policies added in
 			// migration 00009 back up the manual "where tenant_id = ..." filtering
@@ -893,7 +893,7 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 func (s *Server) writeRequired(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u := r.Context().Value(userKey).(user)
-		if u.Role != "superadmin" && u.Role != "admin" {
+		if u.Role != "superadmin" && u.Role != "admin" && u.Role != "editor" {
 			fail(w, 403, "FORBIDDEN", "Read-only role")
 			return
 		}
@@ -921,12 +921,34 @@ func (s *Server) superAdminGlobalRequired(next http.HandlerFunc) http.HandlerFun
 	})
 }
 
+// userManagementRequired lets a tenant's own admin manage that tenant's users
+// (previously only a global superadmin could touch /users at all), in
+// addition to superadmins. Handlers behind it still scope every query to the
+// caller's tenant via tenantKey, and separately guard against a tenant admin
+// creating, editing, or deleting a superadmin account.
+func (s *Server) userManagementRequired(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		role := r.Context().Value(userKey).(user).Role
+		if role != "superadmin" && role != "admin" {
+			fail(w, 403, "ADMIN_REQUIRED", "Administrator access required")
+			return
+		}
+		next(w, r)
+	}
+}
+
 func validUserRole(role string) bool {
-	return role == "superadmin" || role == "admin" || role == "viewer"
+	return role == "superadmin" || role == "admin" || role == "editor" || role == "viewer"
 }
 
 func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), `select id,name,email,role::text,created_at,updated_at from users where tenant_id=$1 or role='superadmin' order by name`, r.Context().Value(tenantKey).(string))
+	caller := r.Context().Value(userKey).(user)
+	tenantID := r.Context().Value(tenantKey).(string)
+	query := `select id,name,email,role::text,created_at,updated_at from users where tenant_id=$1 order by name`
+	if caller.Role == "superadmin" {
+		query = `select id,name,email,role::text,created_at,updated_at from users where tenant_id=$1 or role='superadmin' order by name`
+	}
+	rows, err := s.db.Query(r.Context(), query, tenantID)
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", "Could not list users")
 		return
@@ -967,6 +989,10 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		fail(w, 422, "INVALID_USER", "Name, valid email, role, and a 12-character password are required")
 		return
 	}
+	if in.Role == "superadmin" && r.Context().Value(userKey).(user).Role != "superadmin" {
+		fail(w, 403, "SUPERADMIN_REQUIRED", "Only a superadministrator can grant that role")
+		return
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
 	if err != nil {
 		fail(w, 500, "PASSWORD_ERROR", "Could not secure password")
@@ -1001,12 +1027,21 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 		fail(w, 422, "INVALID_USER", "Name, valid email, and role are required")
 		return
 	}
+	caller := r.Context().Value(userKey).(user)
+	if in.Role == "superadmin" && caller.Role != "superadmin" {
+		fail(w, 403, "SUPERADMIN_REQUIRED", "Only a superadministrator can grant that role")
+		return
+	}
 	var currentRole string
 	if err := s.db.QueryRow(r.Context(), `select role::text from users where id=$1 and (tenant_id=$2 or role='superadmin')`, id, r.Context().Value(tenantKey).(string)).Scan(&currentRole); errors.Is(err, pgx.ErrNoRows) {
 		fail(w, 404, "USER_NOT_FOUND", "User not found")
 		return
 	} else if err != nil {
 		fail(w, 500, "QUERY_FAILED", "Could not read user")
+		return
+	}
+	if currentRole == "superadmin" && caller.Role != "superadmin" {
+		fail(w, 403, "SUPERADMIN_REQUIRED", "Only a superadministrator can modify a superadministrator")
 		return
 	}
 	if currentRole == "superadmin" && in.Role != "superadmin" {
@@ -1062,6 +1097,10 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if role == "superadmin" {
+		if current.Role != "superadmin" {
+			fail(w, 403, "SUPERADMIN_REQUIRED", "Only a superadministrator can delete a superadministrator")
+			return
+		}
 		var count int
 		_ = s.db.QueryRow(r.Context(), `select count(*) from users where role='superadmin'`).Scan(&count)
 		if count <= 1 {
