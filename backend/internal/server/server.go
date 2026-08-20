@@ -61,7 +61,7 @@ func BootstrapAdmin(ctx context.Context, db *pgxpool.Pool, name, email, password
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(ctx, `insert into users(name,email,password_hash,role) values($1,$2,$3,'superadmin')`, name, strings.ToLower(strings.TrimSpace(email)), string(hash))
+	_, err = db.Exec(ctx, `insert into users(name,email,password_hash,role) values($1,$2,$3,'master')`, name, strings.ToLower(strings.TrimSpace(email)), string(hash))
 	return err
 }
 
@@ -533,11 +533,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "INVALID_CREDENTIALS", "Invalid email or password")
 		return
 	}
-	if scope.Kind == "global" && u.Role != "superadmin" {
+	if scope.Kind == "global" && u.Role != "master" {
 		fail(w, 401, "INVALID_CREDENTIALS", "Invalid email or password")
 		return
 	}
-	if scope.Kind == "tenant" && u.Role != "superadmin" && (assignedTenant == nil || *assignedTenant != scope.TenantID) {
+	if scope.Kind == "tenant" && u.Role != "master" && (assignedTenant == nil || *assignedTenant != scope.TenantID) {
 		fail(w, 401, "INVALID_CREDENTIALS", "Invalid email or password")
 		return
 	}
@@ -593,11 +593,11 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			fail(w, 401, "UNAUTHENTICATED", "Session expired")
 			return
 		}
-		if u.Role != "superadmin" && (assignedTenant == nil || *assignedTenant != u.TenantID) {
+		if u.Role != "master" && (assignedTenant == nil || *assignedTenant != u.TenantID) {
 			fail(w, 403, "TENANT_FORBIDDEN", "Tenant access denied")
 			return
 		}
-		if scope.Kind == "global" && u.Role != "superadmin" {
+		if scope.Kind == "global" && u.Role != "master" {
 			fail(w, 403, "GLOBAL_PORTAL_REQUIRED", "Use your organization portal")
 			return
 		}
@@ -628,7 +628,7 @@ func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 		(select count(*) from users x where x.tenant_id=t.id)
 		from tenants t where t.id=$1 order by t.name`
 	args := []any{u.TenantID}
-	if u.Role == "superadmin" && u.Portal != "tenant" {
+	if u.Role == "master" && u.Portal != "tenant" {
 		query = `select t.id,t.name,t.slug,t.created_at,t.updated_at,coalesce(t.brand_name,''),t.logo_data is not null,t.favicon_data is not null,
 			(select count(*) from sites s where s.tenant_id=t.id),
 			(select count(*) from devices d where d.tenant_id=t.id),
@@ -900,7 +900,7 @@ func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 func (s *Server) writeRequired(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		u := r.Context().Value(userKey).(user)
-		if u.Role != "superadmin" && u.Role != "admin" && u.Role != "editor" {
+		if u.Role != "master" && u.Role != "superadmin" && u.Role != "admin" && u.Role != "editor" {
 			fail(w, 403, "FORBIDDEN", "Read-only role")
 			return
 		}
@@ -910,7 +910,7 @@ func (s *Server) writeRequired(next http.HandlerFunc) http.HandlerFunc {
 
 func (s *Server) superAdminRequired(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Context().Value(userKey).(user).Role != "superadmin" {
+		if r.Context().Value(userKey).(user).Role != "master" {
 			fail(w, 403, "SUPERADMIN_REQUIRED", "Superadministrator access required")
 			return
 		}
@@ -936,7 +936,7 @@ func (s *Server) superAdminGlobalRequired(next http.HandlerFunc) http.HandlerFun
 func (s *Server) userManagementRequired(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		role := r.Context().Value(userKey).(user).Role
-		if role != "superadmin" && role != "admin" {
+		if role != "master" && role != "superadmin" && role != "admin" {
 			fail(w, 403, "ADMIN_REQUIRED", "Administrator access required")
 			return
 		}
@@ -949,12 +949,8 @@ func validUserRole(role string) bool {
 }
 
 func (s *Server) listUsers(w http.ResponseWriter, r *http.Request) {
-	caller := r.Context().Value(userKey).(user)
 	tenantID := r.Context().Value(tenantKey).(string)
 	query := `select id,name,email,role::text,created_at,updated_at from users where tenant_id=$1 order by name`
-	if caller.Role == "superadmin" {
-		query = `select id,name,email,role::text,created_at,updated_at from users where tenant_id=$1 or role='superadmin' order by name`
-	}
 	rows, err := s.db.Query(r.Context(), query, tenantID)
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", "Could not list users")
@@ -996,7 +992,8 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		fail(w, 422, "INVALID_USER", "Name, valid email, role, and a 12-character password are required")
 		return
 	}
-	if in.Role == "superadmin" && r.Context().Value(userKey).(user).Role != "superadmin" {
+	callerRole := r.Context().Value(userKey).(user).Role
+	if in.Role == "superadmin" && callerRole != "master" && callerRole != "superadmin" {
 		fail(w, 403, "SUPERADMIN_REQUIRED", "Only a superadministrator can grant that role")
 		return
 	}
@@ -1007,9 +1004,6 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 	}
 	var id string
 	var tenantID any = r.Context().Value(tenantKey).(string)
-	if in.Role == "superadmin" {
-		tenantID = nil
-	}
 	err = s.db.QueryRow(r.Context(), `insert into users(name,email,password_hash,role,tenant_id) values($1,lower($2),$3,$4,$5) returning id`, strings.TrimSpace(in.Name), strings.TrimSpace(in.Email), string(hash), in.Role, tenantID).Scan(&id)
 	if err != nil {
 		fail(w, 422, "USER_CREATE_FAILED", err.Error())
@@ -1035,34 +1029,31 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	caller := r.Context().Value(userKey).(user)
-	if in.Role == "superadmin" && caller.Role != "superadmin" {
+	if in.Role == "superadmin" && caller.Role != "master" && caller.Role != "superadmin" {
 		fail(w, 403, "SUPERADMIN_REQUIRED", "Only a superadministrator can grant that role")
 		return
 	}
 	var currentRole string
-	if err := s.db.QueryRow(r.Context(), `select role::text from users where id=$1 and (tenant_id=$2 or role='superadmin')`, id, r.Context().Value(tenantKey).(string)).Scan(&currentRole); errors.Is(err, pgx.ErrNoRows) {
+	if err := s.db.QueryRow(r.Context(), `select role::text from users where id=$1 and tenant_id=$2`, id, r.Context().Value(tenantKey).(string)).Scan(&currentRole); errors.Is(err, pgx.ErrNoRows) {
 		fail(w, 404, "USER_NOT_FOUND", "User not found")
 		return
 	} else if err != nil {
 		fail(w, 500, "QUERY_FAILED", "Could not read user")
 		return
 	}
-	if currentRole == "superadmin" && caller.Role != "superadmin" {
+	if currentRole == "superadmin" && caller.Role != "master" && caller.Role != "superadmin" {
 		fail(w, 403, "SUPERADMIN_REQUIRED", "Only a superadministrator can modify a superadministrator")
 		return
 	}
 	if currentRole == "superadmin" && in.Role != "superadmin" {
 		var count int
-		_ = s.db.QueryRow(r.Context(), `select count(*) from users where role='superadmin'`).Scan(&count)
+		_ = s.db.QueryRow(r.Context(), `select count(*) from users where role='superadmin' and tenant_id=$1`, r.Context().Value(tenantKey).(string)).Scan(&count)
 		if count <= 1 {
 			fail(w, 409, "LAST_SUPERADMIN", "The last superadministrator cannot be demoted")
 			return
 		}
 	}
 	var newTenant any = r.Context().Value(tenantKey).(string)
-	if in.Role == "superadmin" {
-		newTenant = nil
-	}
 	if in.Password != "" {
 		if len(in.Password) < 12 {
 			fail(w, 422, "WEAK_PASSWORD", "Password must have at least 12 characters")
@@ -1096,7 +1087,7 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var role string
-	if err := s.db.QueryRow(r.Context(), `select role::text from users where id=$1 and (tenant_id=$2 or role='superadmin')`, id, r.Context().Value(tenantKey).(string)).Scan(&role); errors.Is(err, pgx.ErrNoRows) {
+	if err := s.db.QueryRow(r.Context(), `select role::text from users where id=$1 and tenant_id=$2`, id, r.Context().Value(tenantKey).(string)).Scan(&role); errors.Is(err, pgx.ErrNoRows) {
 		fail(w, 404, "USER_NOT_FOUND", "User not found")
 		return
 	} else if err != nil {
@@ -1104,12 +1095,12 @@ func (s *Server) deleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if role == "superadmin" {
-		if current.Role != "superadmin" {
+		if current.Role != "master" && current.Role != "superadmin" {
 			fail(w, 403, "SUPERADMIN_REQUIRED", "Only a superadministrator can delete a superadministrator")
 			return
 		}
 		var count int
-		_ = s.db.QueryRow(r.Context(), `select count(*) from users where role='superadmin'`).Scan(&count)
+		_ = s.db.QueryRow(r.Context(), `select count(*) from users where role='superadmin' and tenant_id=$1`, r.Context().Value(tenantKey).(string)).Scan(&count)
 		if count <= 1 {
 			fail(w, 409, "LAST_SUPERADMIN", "The last superadministrator cannot be deleted")
 			return
