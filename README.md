@@ -53,16 +53,7 @@ Set `APP_BASE_DOMAIN=atlas.tiiv.com.br` to enable host-based tenant portals. The
 
 Create DNS records for both `atlas.tiiv.com.br` and `*.atlas.tiiv.com.br` pointing to the Nginx Proxy Manager address. In Nginx Proxy Manager, create one Proxy Host containing both names, forward it with scheme `http` to the VM LAN address on port `15467`, and attach a certificate covering the base and wildcard names. Wildcard Let's Encrypt certificates require a supported DNS challenge. No tenant-specific containers or proxy entries are required after the wildcard is configured.
 
-Back up the `atlas-postgres` volume regularly. Before upgrades, take a PostgreSQL dump and apply new numbered files from `backend/db/migrations` in order. The baseline migration initializes a new production database; development seed data is never mounted by the production Compose file.
-
-For an existing installation, apply the multitenancy migration after the backup. It preserves existing records and assigns them to `Default Organization`:
-
-```bash
-docker compose exec postgres \
-  sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /docker-entrypoint-initdb.d/00007_multitenancy.sql'
-```
-
-The named `atlas-postgres` volume persists data. The initial schema and seed are applied automatically only when the volume is first created.
+Back up the `atlas-postgres` volume regularly. The named `atlas-postgres` volume persists data, and every file in `backend/db/migrations` runs automatically, in order, only when that volume is first created (a brand new production database). For an existing installation, take a backup and then run `make migrate`: it tracks which migration files have already run in a `schema_migrations` table and applies only the ones that haven't, in filename order, so it's safe to run after every upgrade regardless of how far behind the installation is.
 
 ## Local development
 
@@ -73,7 +64,7 @@ cd backend && DATABASE_URL='postgres://atlas:atlas_change_me@localhost:5432/tiiv
 cd frontend && pnpm install && pnpm dev
 ```
 
-The Vite server proxies API calls to port 8080. Useful targets include `make test`, `make build`, `make lint`, `make seed` (re-applies `backend/db/seed.sql` against the running dev database; safe to run repeatedly), and `make migrate FILE=<name>.sql` (applies one new file from `backend/db/migrations` against the running dev database — pass only a file you have not applied yet; migrations are append-only, so replaying an old one against data it already migrated is not safe). `make dev`, `make migrate`, and `make seed` fall back to `podman compose` automatically when the `docker` binary isn't present, so the same commands work on a local Podman setup.
+The Vite server proxies API calls to port 8080. Useful targets include `make test`, `make build`, `make lint`, `make seed` (re-applies `backend/db/seed.sql` against the running dev database; safe to run repeatedly), and `make migrate` (applies every file in `backend/db/migrations` that hasn't run yet against the running dev database, tracked in a `schema_migrations` table; safe to run repeatedly since already-applied files are skipped). `make dev`, `make migrate`, and `make seed` fall back to `podman compose` automatically when the `docker` binary isn't present, so the same commands work on a local Podman setup.
 
 ## Configuration
 

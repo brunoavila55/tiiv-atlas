@@ -11,7 +11,7 @@ test:
 	cd backend && go test ./...
 	cd frontend && pnpm test -- --run
 migrate:
-	docker compose exec -T postgres psql -U $${POSTGRES_USER:-atlas} -d $${POSTGRES_DB:-tiiv_atlas} -f /docker-entrypoint-initdb.d/001-schema.sql
+	docker compose exec -T postgres sh /opt/atlas/migrate.sh
 migrate-down:
 	@echo "Migrations are append-only in the MVP; recreate the development volume if needed."
 seed:
