@@ -4,6 +4,7 @@ import {Activity,Boxes,Building2,Cable,LayoutDashboard,MapPin,Menu,MonitorCog,Mo
 import {QuickInstall} from './QuickInstall';
 import {SitesPage,RoomsPage} from './ResourcePages';
 import {IPAddressesPage} from './IPManagement';
+import {NetworkAddressesPage} from './NetworkGrid';
 import {ManufacturersPage,DeviceModelsPage,VlansPage,PortsPage} from './CatalogPages';
 import {LiveTopologyPage} from './LiveTopology';
 import {UsersPage} from './UsersPage';
@@ -57,7 +58,7 @@ function Shell({me,portal}:{me:SessionUser;portal:PortalInfo}){
     </aside>
     <main><header><button className="menu" onClick={()=>setOpen(true)}><Menu/></button>{controlMode?<div className="control-title"><Building2/><div><strong>Superadmin</strong><small>Organizations and access management</small></div></div>:<div className="global-search"><Search size={17}/><input aria-label="Global search" placeholder="Search devices, IPs, racks…" onKeyDown={event=>{if(event.key==='Enter')nav('/devices?q='+encodeURIComponent(event.currentTarget.value))}}/><kbd>⌘ K</kbd></div>}<button className="theme" onClick={()=>setDark(!dark)}>{dark?<Sun/>:<Moon/>}</button></header>
       <div className="content"><Routes>
-        <Route path="/" element={isGlobalSuper?<Navigate to="/tenants" replace/>:<Dashboard/>}/><Route path="/dashboard" element={<Dashboard/>}/><Route path="/sites" element={<SitesPage/>}/><Route path="/rooms" element={<RoomsPage/>}/><Route path="/racks" element={<RackPage/>}/><Route path="/devices" element={<DevicesPage/>}/><Route path="/topology" element={<LiveTopologyPage/>}/><Route path="/networks" element={<NetworksPage/>}/><Route path="/ip-addresses" element={<IPAddressesPage/>}/><Route path="/connections" element={<ConnectionsPage/>}/><Route path="/ports" element={<PortsPage/>}/><Route path="/vlans" element={<VlansPage/>}/><Route path="/manufacturers" element={<ManufacturersPage/>}/><Route path="/device-models" element={<DeviceModelsPage/>}/><Route path="/users" element={isSuper?<UsersPage/>:<Navigate to="/" replace/>}/><Route path="/tenants" element={isGlobalSuper?<TenantsPage/>:<Navigate to="/" replace/>}/><Route path="*" element={<PlaceholderPage/>}/>
+        <Route path="/" element={isGlobalSuper?<Navigate to="/tenants" replace/>:<Dashboard/>}/><Route path="/dashboard" element={<Dashboard/>}/><Route path="/sites" element={<SitesPage/>}/><Route path="/rooms" element={<RoomsPage/>}/><Route path="/racks" element={<RackPage/>}/><Route path="/devices" element={<DevicesPage/>}/><Route path="/topology" element={<LiveTopologyPage/>}/><Route path="/networks" element={<NetworksPage/>}/><Route path="/networks/:id" element={<NetworkAddressesPage/>}/><Route path="/ip-addresses" element={<IPAddressesPage/>}/><Route path="/connections" element={<ConnectionsPage/>}/><Route path="/ports" element={<PortsPage/>}/><Route path="/vlans" element={<VlansPage/>}/><Route path="/manufacturers" element={<ManufacturersPage/>}/><Route path="/device-models" element={<DeviceModelsPage/>}/><Route path="/users" element={isSuper?<UsersPage/>:<Navigate to="/" replace/>}/><Route path="/tenants" element={isGlobalSuper?<TenantsPage/>:<Navigate to="/" replace/>}/><Route path="*" element={<PlaceholderPage/>}/>
       </Routes></div>
     </main>
   </div></div>;

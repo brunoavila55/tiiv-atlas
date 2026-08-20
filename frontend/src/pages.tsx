@@ -1,7 +1,8 @@
 import {useEffect,useState} from 'react';
 import {Link,useLocation} from 'react-router-dom';
-import {Activity,AlertTriangle,Cable,ChevronRight,MapPin,Network,PanelsTopLeft as Racks,Plus,Server,Tags,X} from 'lucide-react';
+import {Activity,AlertTriangle,Cable,ChevronRight,CornerDownRight,MapPin,Network,PanelsTopLeft as Racks,Plus,Server,Tags,X} from 'lucide-react';
 import {api,type ConnectionEdge,type Device,type NetworkRow,type Port,type Rack,type Site} from './lib/api';
+import {cidrContains,isIPv6Prefix,parseCIDR} from './lib/cidr';
 import {RowMenu} from './RowMenu';
 
 const title=(heading:string,desc:string,action?:string,onAction?:()=>void)=><div className="page-head"><div><h1>{heading}</h1><p>{desc}</p></div>{action&&<button className="primary" onClick={onAction}><Plus size={15}/>{action}</button>}</div>;
@@ -201,6 +202,59 @@ function ipv4Capacity(prefix:string):number|null{
   return Math.max(0,Math.pow(2,bits)-2);
 }
 
+// Networks nest purely by CIDR containment (no parent_id column — see the
+// backend's networkAddresses handler), so the tree shown here is derived the
+// same way: for every network, its parent is the narrowest other network
+// whose prefix contains it.
+type TreeNode=NetworkRow&{children:TreeNode[]};
+function buildForest(networks:NetworkRow[]):TreeNode[]{
+  const nodes:TreeNode[]=networks.map(n=>({...n,children:[]}));
+  const parentOf=new Map<string,TreeNode>();
+  for(const n of nodes){
+    let best:TreeNode|undefined,bestBits=-1;
+    for(const other of nodes){
+      if(other.id===n.id)continue;
+      if(cidrContains(other.prefix,n.prefix)){
+        const bits=parseCIDR(other.prefix)?.bits??-1;
+        if(bits>bestBits){best=other;bestBits=bits}
+      }
+    }
+    if(best)parentOf.set(n.id,best);
+  }
+  for(const n of nodes){const p=parentOf.get(n.id);if(p)p.children.push(n)}
+  const roots=nodes.filter(n=>!parentOf.has(n.id));
+  const byBase=(a:TreeNode,b:TreeNode)=>{const ba=parseCIDR(a.prefix)?.base??0n,bb=parseCIDR(b.prefix)?.base??0n;return ba<bb?-1:ba>bb?1:0};
+  const sortRec=(list:TreeNode[])=>{list.sort(byBase);list.forEach(n=>sortRec(n.children))};
+  sortRec(roots);
+  return roots;
+}
+function countDescendants(n:TreeNode):number{return n.children.reduce((sum,c)=>sum+1+countDescendants(c),0)}
+
+function NetworkRowGroup({node,depth,sites,ipCounts,onEdit,onDelete}:{node:TreeNode;depth:number;sites:Site[];ipCounts:Record<string,number>;onEdit:(n:NetworkRow)=>void;onDelete:(n:NetworkRow)=>void}){
+  const capacity=ipv4Capacity(node.prefix);
+  const used=ipCounts[node.id]||0;
+  const pct=capacity?Math.min(100,Math.round(used/capacity*100)):0;
+  const descendants=countDescendants(node);
+  const isV6=isIPv6Prefix(node.prefix);
+  return <div className="network-node">
+    <div className={depth===0?'network-row':'network-row nested'}>
+      <div className="network-prefix-cell" style={depth>0?{paddingLeft:(depth-1)*24}:undefined}>
+        {depth>0&&<CornerDownRight size={14} className="network-connector-icon"/>}
+        <Link to={`/networks/${node.id}`} className="mono linkish">{node.prefix}</Link>
+        {descendants>0&&<span className="network-subnet-count">{descendants} subnet{descendants>1?'s':''}</span>}
+      </div>
+      <div><strong>{node.name}</strong></div>
+      <div>{sites.find(s=>s.id===node.site_id)?.name??'—'}</div>
+      <div className="mono">{node.gateway||'—'}</div>
+      <div>{capacity?<><span className="mini-bar"><i style={{width:`${pct}%`}}/></span>{used} / {capacity}</>:isV6?<span className="cell-detail">{used} documented</span>:'—'}</div>
+      <div><RowMenu items={[{label:'Edit network',onClick:()=>onEdit(node)},{label:'Delete network',danger:true,onClick:()=>onDelete(node)}]}/></div>
+    </div>
+    {node.children.length>0&&<div className="network-children">
+      {node.children.map(child=><NetworkRowGroup key={child.id} node={child} depth={depth+1} sites={sites} ipCounts={ipCounts} onEdit={onEdit} onDelete={onDelete}/>)}
+    </div>}
+  </div>;
+}
+
 export function NetworksPage(){
   const [networks,setNetworks]=useState<NetworkRow[]>([]);
   const [sites,setSites]=useState<Site[]>([]);
@@ -217,12 +271,30 @@ export function NetworksPage(){
   const save=async()=>{try{const body=editing?{...form,site_id:form.site_id||null,gateway:form.gateway||null}:Object.fromEntries(Object.entries(form).filter(([,v])=>v!==''));if(editing)await api(`/networks/${editing.id}`,{method:'PUT',body:JSON.stringify(body)});else await api('/networks',{method:'POST',body:JSON.stringify(body)});setOpen(false);load()}catch(e){setError(e instanceof Error?e.message:'Could not save network')}};
   const remove=async(n:NetworkRow)=>{if(!confirm(`Delete ${n.name}?`))return;try{await api(`/networks/${n.id}`,{method:'DELETE'});load()}catch(e){setError(e instanceof Error?e.message:'Could not delete network')}};
 
+  const forest=buildForest(networks);
+  const parentHint=(()=>{
+    if(!form.prefix)return null;
+    let best:NetworkRow|undefined,bestBits=-1;
+    for(const n of networks){
+      if(n.id===editing?.id)continue;
+      if(cidrContains(n.prefix,form.prefix)){
+        const bits=parseCIDR(n.prefix)?.bits??-1;
+        if(bits>bestBits){best=n;bestBits=bits}
+      }
+    }
+    return best;
+  })();
+
   return <>
     {title('Networks','Document IPv4 and IPv6 address space.','Add network',startAdd)}
     {error&&!open&&<div className="form-error page-error">{error}</div>}
-    <section className="panel">{networks.length===0?<div className="resource-empty"><Network/><h2>No networks yet</h2><p>Document a prefix to start assigning addresses.</p><button className="primary" onClick={startAdd}><Plus size={15}/>Add network</button></div>:<div className="table-wrap"><table><thead><tr><th>Prefix</th><th>Name</th><th>Site</th><th>Gateway</th><th>Utilization</th><th/></tr></thead><tbody>{networks.map(n=>{const capacity=ipv4Capacity(n.prefix);const used=ipCounts[n.id]||0;const pct=capacity?Math.min(100,Math.round(used/capacity*100)):0;return <tr key={n.id}><td className="mono linkish">{n.prefix}</td><td><strong>{n.name}</strong></td><td>{sites.find(s=>s.id===n.site_id)?.name??'—'}</td><td className="mono">{n.gateway||'—'}</td><td>{capacity?<><span className="mini-bar"><i style={{width:`${pct}%`}}/></span>{used} / {capacity}</>:'—'}</td><td><RowMenu items={[{label:'Edit network',onClick:()=>startEdit(n)},{label:'Delete network',danger:true,onClick:()=>void remove(n)}]}/></td></tr>})}</tbody></table></div>}</section>
+    {networks.length===0?<section className="panel"><div className="resource-empty"><Network/><h2>No networks yet</h2><p>Document a prefix to start assigning addresses.</p><button className="primary" onClick={startAdd}><Plus size={15}/>Add network</button></div></section>:<section className="panel network-tree">
+      <div className="network-row header"><div>Prefix</div><div>Name</div><div>Site</div><div>Gateway</div><div>Utilization</div><div/></div>
+      {forest.map(n=><NetworkRowGroup key={n.id} node={n} depth={0} sites={sites} ipCounts={ipCounts} onEdit={startEdit} onDelete={target=>void remove(target)}/>)}
+    </section>}
     {open&&<Modal title={editing?'Edit network':'Add network'} description="Document a routed prefix to assign addresses from." close={()=>setOpen(false)} save={()=>void save()} error={error} saveLabel={editing?'Save changes':'Add network'} saveDisabled={!form.prefix||!form.name}>
-      <label>Prefix (CIDR)<input autoFocus value={form.prefix} onChange={e=>setForm(f=>({...f,prefix:e.target.value}))} placeholder="10.10.0.0/24"/></label>
+      <label>Prefix (CIDR)<input autoFocus value={form.prefix} onChange={e=>setForm(f=>({...f,prefix:e.target.value}))} placeholder="10.10.0.0/24 or 2001:db8::/48"/></label>
+      {parentHint&&<p className="cidr-hint ok">✓ Nests under {parentHint.prefix} · {parentHint.name} automatically</p>}
       <label>Name<input value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Management"/></label>
       <label>Site (optional)<select value={form.site_id} onChange={e=>setForm(f=>({...f,site_id:e.target.value}))}><option value="">No site</option>{sites.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
       <label>Gateway (optional)<input value={form.gateway} onChange={e=>setForm(f=>({...f,gateway:e.target.value}))} placeholder="10.10.0.1"/></label>

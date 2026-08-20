@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -183,6 +184,7 @@ func New(db *pgxpool.Pool, log *slog.Logger, secure bool) http.Handler {
 				r.Get("/devices/{id}/ports", s.devicePorts)
 				r.Post("/devices/{id}/ports/bulk", s.writeRequired(s.bulkPorts))
 				r.Post("/devices/quick-create", s.writeRequired(s.quickCreateDevice))
+				r.Get("/networks/{id}/addresses", s.networkAddresses)
 			})
 		})
 	})
@@ -1292,6 +1294,201 @@ func (s *Server) bulkPorts(w http.ResponseWriter, r *http.Request) {
 	_ = tx.Commit(r.Context())
 	respond(w, 201, map[string]any{"data": map[string]int{"created": in.End - in.Start + 1}})
 }
+
+// maxNetworkAddresses caps how large a prefix networkAddresses will expand
+// into individual rows (a /20 IPv4 network), so a mistakenly huge prefix
+// (e.g. /8) can't generate millions of rows in one response.
+const maxNetworkAddresses = 4096
+
+type networkAddress struct {
+	Address      string `json:"address"`
+	ID           string `json:"id,omitempty"`
+	DeviceID     string `json:"device_id,omitempty"`
+	DeviceName   string `json:"device_name,omitempty"`
+	DeviceType   string `json:"device_type,omitempty"`
+	AssignedTo   string `json:"assigned_to,omitempty"`
+	DNSName      string `json:"dns_name,omitempty"`
+	Description  string `json:"description,omitempty"`
+	Status       string `json:"status"`
+	Special      string `json:"special,omitempty"`
+	SubnetID     string `json:"subnet_id,omitempty"`
+	SubnetPrefix string `json:"subnet_prefix,omitempty"`
+	SubnetName   string `json:"subnet_name,omitempty"`
+}
+
+type relatedNetwork struct {
+	ID     string `json:"id"`
+	Prefix string `json:"prefix"`
+	Name   string `json:"name"`
+}
+
+// networkAddresses reports every address known about inside a documented
+// network's CIDR prefix, left-joined against any ip_addresses row already
+// documented for that address.
+//
+// IPv4 prefixes (up to /20, 4096 addresses) are fully expanded into one row
+// per address, so undocumented addresses come back with status "free" and
+// the frontend can render a phpIPAM-style grid of the whole space. IPv6
+// prefixes are never expanded this way — even a /64 has 2^64 addresses, so
+// "list every address" is meaningless there. For IPv6 this instead returns
+// only the addresses someone has actually documented, most specific first;
+// the UI's job for IPv6 is exact-match lookup and documentation, not a grid
+// of free slots.
+//
+// Networks nest by CIDR containment alone — there is no parent_id column,
+// and the containment check works identically for IPv4 and IPv6 since it's
+// backed by Postgres's cidr "<<"/">>" operators. Any other documented
+// network whose prefix falls inside this one is treated as a subnet of it,
+// at any depth. That also means it works retroactively: creating
+// 10.0.0.0/21 and 10.0.0.0/27 nests the /27 under the /21 automatically, in
+// whichever order they were created. An address handed to a subnet is
+// rolled up here too (so the parent's utilization reflects it) and, for
+// IPv4, when it has no row of its own, is reported as status "subnet"
+// pointing at the most specific subnet that contains it, rather than as
+// free space directly assignable at this level.
+func (s *Server) networkAddresses(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Context().Value(tenantKey).(string)
+	networkID := chi.URLParam(r, "id")
+	var prefix string
+	if err := s.q(r).QueryRow(r.Context(), `select prefix::text from networks where id=$1 and tenant_id=$2`, networkID, tenantID).Scan(&prefix); errors.Is(err, pgx.ErrNoRows) {
+		fail(w, 404, "NOT_FOUND", "Network not found")
+		return
+	} else if err != nil {
+		fail(w, 500, "QUERY_FAILED", err.Error())
+		return
+	}
+	_, ipnet, err := net.ParseCIDR(prefix)
+	if err != nil {
+		fail(w, 422, "UNSUPPORTED_PREFIX", "Could not parse this network's prefix")
+		return
+	}
+	isIPv4 := ipnet.IP.To4() != nil
+	family := "ipv6"
+	var ones int
+	var v4Count uint64
+	if isIPv4 {
+		family = "ipv4"
+		ones, _ = ipnet.Mask.Size()
+		v4Count = uint64(1) << uint(32-ones)
+		if v4Count > maxNetworkAddresses {
+			fail(w, 422, "PREFIX_TOO_LARGE", fmt.Sprintf("This prefix has %d addresses, which is too many to list individually (max %d, a /20). Narrow it or split it into smaller networks.", v4Count, maxNetworkAddresses))
+			return
+		}
+	}
+
+	type subnet struct {
+		id, prefix, name string
+		ipnet            *net.IPNet
+	}
+	subRows, err := s.q(r).Query(r.Context(), `select id,prefix::text,name from networks where tenant_id=$1 and prefix<<$2::cidr and id<>$3 order by masklen(prefix) desc`, tenantID, prefix, networkID)
+	if err != nil {
+		fail(w, 500, "QUERY_FAILED", err.Error())
+		return
+	}
+	var subnets []subnet
+	subnetIDs := []string{networkID}
+	for subRows.Next() {
+		var sn subnet
+		if err := subRows.Scan(&sn.id, &sn.prefix, &sn.name); err != nil {
+			subRows.Close()
+			fail(w, 500, "QUERY_FAILED", err.Error())
+			return
+		}
+		if _, sub, err := net.ParseCIDR(sn.prefix); err == nil && (sub.IP.To4() != nil) == isIPv4 {
+			sn.ipnet = sub
+			subnets = append(subnets, sn)
+			subnetIDs = append(subnetIDs, sn.id)
+		}
+	}
+	subRows.Close()
+
+	var parent *relatedNetwork
+	var p relatedNetwork
+	if err := s.q(r).QueryRow(r.Context(), `select id,prefix::text,name from networks where tenant_id=$1 and prefix>>$2::cidr and id<>$3 order by masklen(prefix) desc limit 1`, tenantID, prefix, networkID).Scan(&p.ID, &p.Prefix, &p.Name); err == nil {
+		parent = &p
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		fail(w, 500, "QUERY_FAILED", err.Error())
+		return
+	}
+
+	// host(ip.address), not ip.address::text: casting an inet to text keeps its
+	// netmask (e.g. "192.168.0.10/32"), which would never match the bare
+	// address strings this handler compares below. network_id=any($2) pulls
+	// in addresses documented directly on this network AND on any subnet
+	// nested inside it, so a device attached inside a /27 (or a ::/112, for
+	// IPv6) shows up when viewing the containing network. "order by
+	// ip.address" gives IPv6's non-enumerated path a sensible numeric order
+	// for free.
+	rows, err := s.q(r).Query(r.Context(), `select host(ip.address),ip.id,coalesce(ip.device_id::text,''),coalesce(d.name,''),coalesce(d.device_type,''),coalesce(ip.assigned_to,''),coalesce(ip.dns_name,''),coalesce(ip.description,''),ip.status,coalesce(ip.network_id::text,'') from ip_addresses ip left join devices d on d.id=ip.device_id and d.tenant_id=ip.tenant_id where ip.tenant_id=$1 and ip.network_id=any($2::uuid[]) order by ip.address`, tenantID, subnetIDs)
+	if err != nil {
+		fail(w, 500, "QUERY_FAILED", err.Error())
+		return
+	}
+	defer rows.Close()
+	existing := map[string]networkAddress{}
+	documented := []networkAddress{}
+	for rows.Next() {
+		var a networkAddress
+		var rowNetworkID string
+		if err := rows.Scan(&a.Address, &a.ID, &a.DeviceID, &a.DeviceName, &a.DeviceType, &a.AssignedTo, &a.DNSName, &a.Description, &a.Status, &rowNetworkID); err != nil {
+			fail(w, 500, "QUERY_FAILED", err.Error())
+			return
+		}
+		for _, sn := range subnets {
+			if sn.id == rowNetworkID {
+				a.SubnetID, a.SubnetPrefix, a.SubnetName = sn.id, sn.prefix, sn.name
+				break
+			}
+		}
+		existing[a.Address] = a
+		documented = append(documented, a)
+	}
+
+	var result []networkAddress
+	total := len(documented)
+	if isIPv4 {
+		base := binary.BigEndian.Uint32(ipnet.IP.To4())
+		result = make([]networkAddress, 0, v4Count)
+		for i := uint32(0); uint64(i) < v4Count; i++ {
+			b := make([]byte, 4)
+			binary.BigEndian.PutUint32(b, base+i)
+			addr := net.IP(b).String()
+			if row, ok := existing[addr]; ok {
+				result = append(result, row)
+				continue
+			}
+			entry := networkAddress{Address: addr, Status: "free"}
+			if ones < 31 {
+				if i == 0 {
+					entry.Special = "network"
+				} else if uint64(i) == v4Count-1 {
+					entry.Special = "broadcast"
+				}
+			}
+			// subnets is sorted most-specific-first, so the first containment
+			// match is the tightest subnet this address was delegated to.
+			if ip := net.ParseIP(addr); ip != nil {
+				for _, sn := range subnets {
+					if sn.ipnet.Contains(ip) {
+						entry.Status = "subnet"
+						entry.SubnetID, entry.SubnetPrefix, entry.SubnetName = sn.id, sn.prefix, sn.name
+						break
+					}
+				}
+			}
+			result = append(result, entry)
+		}
+		total = int(v4Count)
+	} else {
+		result = documented
+	}
+	subnetList := make([]relatedNetwork, len(subnets))
+	for i, sn := range subnets {
+		subnetList[i] = relatedNetwork{ID: sn.id, Prefix: sn.prefix, Name: sn.name}
+	}
+	respond(w, 200, map[string]any{"data": result, "meta": map[string]any{"prefix": prefix, "family": family, "total": total, "parent": parent, "subnets": subnetList}})
+}
+
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	var v json.RawMessage
 	err := s.q(r).QueryRow(r.Context(), `select json_build_object('sites',(select count(*) from sites where tenant_id=$1),'racks',(select count(*) from racks where tenant_id=$1),'devices',(select count(*) from devices where tenant_id=$1),'active_devices',(select count(*) from devices where tenant_id=$1 and status='active'),'networks',(select count(*) from networks where tenant_id=$1),'vlans',(select count(*) from vlans where tenant_id=$1),'connections',(select count(*) from cables where tenant_id=$1))`, r.Context().Value(tenantKey).(string)).Scan(&v)
@@ -1302,7 +1499,9 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"data": v})
 }
 func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.q(r).Query(r.Context(), `select c.id,da.id,da.name,da.device_type,coalesce(da.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=da.id and i.tenant_id=$1),''),da.status::text,pa.name,db.id,db.name,db.device_type,coalesce(db.management_ip::text,''),coalesce((select string_agg(i.address::text, ', ' order by i.address) from ip_addresses i where i.device_id=db.id and i.tenant_id=$1),''),db.status::text,pb.name,c.cable_type,coalesce(c.label,'') from cables c join device_ports pa on pa.id=c.port_a_id join devices da on da.id=pa.device_id join device_ports pb on pb.id=c.port_b_id join devices db on db.id=pb.device_id where c.tenant_id=$1 and pa.tenant_id=$1 and pb.tenant_id=$1 and da.tenant_id=$1 and db.tenant_id=$1`, r.Context().Value(tenantKey).(string))
+	// host(...), not ::text: casting inet to text keeps its netmask (e.g.
+	// "10.10.0.1/32"), which would leak into every management/device IP shown here.
+	rows, err := s.q(r).Query(r.Context(), `select c.id,da.id,da.name,da.device_type,coalesce(host(da.management_ip),''),coalesce((select string_agg(host(i.address), ', ' order by i.address) from ip_addresses i where i.device_id=da.id and i.tenant_id=$1),''),da.status::text,pa.name,db.id,db.name,db.device_type,coalesce(host(db.management_ip),''),coalesce((select string_agg(host(i.address), ', ' order by i.address) from ip_addresses i where i.device_id=db.id and i.tenant_id=$1),''),db.status::text,pb.name,c.cable_type,coalesce(c.label,'') from cables c join device_ports pa on pa.id=c.port_a_id join devices da on da.id=pa.device_id join device_ports pb on pb.id=c.port_b_id join devices db on db.id=pb.device_id where c.tenant_id=$1 and pa.tenant_id=$1 and pb.tenant_id=$1 and da.tenant_id=$1 and db.tenant_id=$1`, r.Context().Value(tenantKey).(string))
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return
@@ -1341,7 +1540,7 @@ func (s *Server) topology(w http.ResponseWriter, r *http.Request) {
 func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	q := "%" + r.URL.Query().Get("q") + "%"
 	tenantID := r.Context().Value(tenantKey).(string)
-	rows, err := s.q(r).Query(r.Context(), `select kind,id,label,detail from (select 'device' kind,id,name label,coalesce(management_ip::text,'') detail from devices where tenant_id=$2 union all select 'site',id,name,description from sites where tenant_id=$2 union all select 'rack',id,name,description from racks where tenant_id=$2 union all select 'ip',i.id,i.address::text,coalesce(d.name,'') from ip_addresses i left join devices d on d.id=i.device_id and d.tenant_id=$2 where i.tenant_id=$2) x where label ilike $1 or detail ilike $1 limit 25`, q, tenantID)
+	rows, err := s.q(r).Query(r.Context(), `select kind,id,label,detail from (select 'device' kind,id,name label,coalesce(host(management_ip),'') detail from devices where tenant_id=$2 union all select 'site',id,name,description from sites where tenant_id=$2 union all select 'rack',id,name,description from racks where tenant_id=$2 union all select 'ip',i.id,host(i.address),coalesce(d.name,'') from ip_addresses i left join devices d on d.id=i.device_id and d.tenant_id=$2 where i.tenant_id=$2) x where label ilike $1 or detail ilike $1 limit 25`, q, tenantID)
 	if err != nil {
 		fail(w, 500, "QUERY_FAILED", err.Error())
 		return
