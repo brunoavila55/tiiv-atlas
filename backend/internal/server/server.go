@@ -1379,10 +1379,12 @@ type relatedNetwork struct {
 // at any depth. That also means it works retroactively: creating
 // 10.0.0.0/21 and 10.0.0.0/27 nests the /27 under the /21 automatically, in
 // whichever order they were created. An address handed to a subnet is
-// rolled up here too (so the parent's utilization reflects it) and, for
-// IPv4, when it has no row of its own, is reported as status "subnet"
-// pointing at the most specific subnet that contains it, rather than as
-// free space directly assignable at this level.
+// rolled up here too (so the parent's utilization reflects it). Membership in
+// a nested subnet is represented by the subnet_* fields and is deliberately
+// kept separate from Status: an undocumented address is still "free", while
+// a documented address keeps its operational status (active, reserved, and
+// so on). The subnet metadata also tells the UI where that address must be
+// managed.
 func (s *Server) networkAddresses(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Context().Value(tenantKey).(string)
 	networkID := chi.URLParam(r, "id")
@@ -1507,7 +1509,6 @@ func (s *Server) networkAddresses(w http.ResponseWriter, r *http.Request) {
 			if ip := net.ParseIP(addr); ip != nil {
 				for _, sn := range subnets {
 					if sn.ipnet.Contains(ip) {
-						entry.Status = "subnet"
 						entry.SubnetID, entry.SubnetPrefix, entry.SubnetName = sn.id, sn.prefix, sn.name
 						break
 					}

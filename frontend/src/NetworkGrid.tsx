@@ -57,7 +57,7 @@ export function NetworkAddressesPage(){
   const percent=total?Math.round(used/total*100):0;
 
   const openAssign=(a:NetworkAddress)=>{
-    if(a.status==='subnet'&&!a.id&&a.subnet_id){nav(`/networks/${a.subnet_id}`);return}
+    if(!a.id&&a.subnet_id){nav(`/networks/${a.subnet_id}`);return}
     setEditing(a);setForm({address:a.address,device_id:a.device_id||'',assigned_to:a.assigned_to||'',dns_name:a.dns_name||'',description:a.description||'',status:a.id?a.status:'active'});setError('');
   };
   // IPv6 space is never enumerated (see fetchAddresses), so there's no "free"
@@ -90,8 +90,7 @@ export function NetworkAddressesPage(){
     }catch(e){setSubnetError(e instanceof Error?e.message:'Could not create subnet')}
   };
   const subnetContained=network?cidrContains(network.prefix,subnetForm.prefix):null;
-  const targetLabel=(a:NetworkAddress)=>a.device_name?<span className="resource-name"><Server size={14}/><strong>{a.device_name}</strong></span>:a.assigned_to?<strong>{a.assigned_to}</strong>:a.status==='subnet'?<Link to={`/networks/${a.subnet_id}`} className="linkish">{a.subnet_prefix} · {a.subnet_name}</Link>:<span className="cell-detail">—</span>;
-  const statusLabel=(a:NetworkAddress)=>a.status==='subnet'?'subnet':a.status;
+  const targetLabel=(a:NetworkAddress)=>a.device_name?<span className="resource-name"><Server size={14}/><strong>{a.device_name}</strong></span>:a.assigned_to?<strong>{a.assigned_to}</strong>:a.subnet_id?<Link to={`/networks/${a.subnet_id}`} className="linkish">{a.subnet_prefix} · {a.subnet_name}</Link>:<span className="cell-detail">—</span>;
 
   const backLink=<Link to="/networks" className="linkish back-link"><ChevronLeft size={14}/> Networks</Link>;
   if(loadError)return <>{backLink}<div className="form-error page-error">{loadError}</div></>;
@@ -111,10 +110,10 @@ export function NetworkAddressesPage(){
     <section className="panel"><div className="table-wrap"><table><thead><tr><th>Address</th><th>Status</th><th>Assigned to</th><th>DNS name</th><th/></tr></thead><tbody>
       {filtered.map(a=><tr key={a.address} className={a.status==='free'?'ip-free-row':''}>
         <td className="mono linkish" onClick={()=>openAssign(a)}>{a.address}{a.special&&<small className="cell-detail">{a.special==='network'?'Network address':'Broadcast address'}</small>}{a.id&&a.subnet_id&&<small className="cell-detail">via {a.subnet_prefix}</small>}</td>
-        <td><span className={'status '+statusLabel(a)}><i/>{statusLabel(a)}</span></td>
+        <td><span className={'status '+a.status}><i/>{a.status}</span></td>
         <td>{targetLabel(a)}</td>
         <td>{a.dns_name||'—'}</td>
-        <td>{a.id?<RowMenu items={[{label:'Edit assignment',onClick:()=>openAssign(a)},{label:'Release address',danger:true,onClick:()=>void release(a)}]}/>:a.status==='subnet'?<Link to={`/networks/${a.subnet_id}`} className="add-link">Open subnet</Link>:<button type="button" className="add-link" onClick={()=>openAssign(a)}>Assign</button>}</td>
+        <td>{a.id?<RowMenu items={[{label:'Edit assignment',onClick:()=>openAssign(a)},{label:'Release address',danger:true,onClick:()=>void release(a)}]}/>:a.subnet_id?<Link to={`/networks/${a.subnet_id}`} className="add-link">Open subnet</Link>:<button type="button" className="add-link" onClick={()=>openAssign(a)}>Assign</button>}</td>
       </tr>)}
       {filtered.length===0&&<tr><td colSpan={5}>{family==='ipv6'?'No addresses documented yet — use "Add address" above.':'No addresses match.'}</td></tr>}
     </tbody></table></div></section>
