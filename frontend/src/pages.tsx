@@ -230,9 +230,9 @@ function buildForest(networks:NetworkRow[]):TreeNode[]{
 }
 function countDescendants(n:TreeNode):number{return n.children.reduce((sum,c)=>sum+1+countDescendants(c),0)}
 
-function NetworkRowGroup({node,depth,sites,ipCounts,onEdit,onDelete}:{node:TreeNode;depth:number;sites:Site[];ipCounts:Record<string,number>;onEdit:(n:NetworkRow)=>void;onDelete:(n:NetworkRow)=>void}){
+function NetworkRowGroup({node,depth,sites,onEdit,onDelete}:{node:TreeNode;depth:number;sites:Site[];onEdit:(n:NetworkRow)=>void;onDelete:(n:NetworkRow)=>void}){
   const capacity=ipv4Capacity(node.prefix);
-  const used=ipCounts[node.id]||0;
+  const used=node.used_count||0;
   const pct=capacity?Math.min(100,Math.round(used/capacity*100)):0;
   const descendants=countDescendants(node);
   const isV6=isIPv6Prefix(node.prefix);
@@ -250,7 +250,7 @@ function NetworkRowGroup({node,depth,sites,ipCounts,onEdit,onDelete}:{node:TreeN
       <div><RowMenu items={[{label:'Edit network',onClick:()=>onEdit(node)},{label:'Delete network',danger:true,onClick:()=>onDelete(node)}]}/></div>
     </div>
     {node.children.length>0&&<div className="network-children">
-      {node.children.map(child=><NetworkRowGroup key={child.id} node={child} depth={depth+1} sites={sites} ipCounts={ipCounts} onEdit={onEdit} onDelete={onDelete}/>)}
+      {node.children.map(child=><NetworkRowGroup key={child.id} node={child} depth={depth+1} sites={sites} onEdit={onEdit} onDelete={onDelete}/>)}
     </div>}
   </div>;
 }
@@ -258,12 +258,11 @@ function NetworkRowGroup({node,depth,sites,ipCounts,onEdit,onDelete}:{node:TreeN
 export function NetworksPage(){
   const [networks,setNetworks]=useState<NetworkRow[]>([]);
   const [sites,setSites]=useState<Site[]>([]);
-  const [ipCounts,setIpCounts]=useState<Record<string,number>>({});
   const [open,setOpen]=useState(false);
   const [editing,setEditing]=useState<NetworkRow|null>(null);
   const [form,setForm]=useState(emptyNetwork);
   const [error,setError]=useState('');
-  const load=()=>Promise.all([api<NetworkRow[]>('/networks?page_size=100'),api<Site[]>('/sites?page_size=100'),api<{network_id?:string}[]>('/ip-addresses?page_size=100')]).then(([n,s,ips])=>{setNetworks(n);setSites(s);const counts:Record<string,number>={};ips.forEach(ip=>{if(ip.network_id)counts[ip.network_id]=(counts[ip.network_id]||0)+1});setIpCounts(counts)}).catch(e=>setError(e.message));
+  const load=()=>Promise.all([api<NetworkRow[]>('/networks?page_size=100'),api<Site[]>('/sites?page_size=100')]).then(([n,s])=>{setNetworks(n);setSites(s)}).catch(e=>setError(e.message));
   useEffect(()=>{void load()},[]);
 
   const startAdd=()=>{setEditing(null);setForm(emptyNetwork);setError('');setOpen(true)};
@@ -290,7 +289,7 @@ export function NetworksPage(){
     {error&&!open&&<div className="form-error page-error">{error}</div>}
     {networks.length===0?<section className="panel"><div className="resource-empty"><Network/><h2>No networks yet</h2><p>Document a prefix to start assigning addresses.</p><button className="primary" onClick={startAdd}><Plus size={15}/>Add network</button></div></section>:<section className="panel network-tree">
       <div className="network-row header"><div>Prefix</div><div>Name</div><div>Site</div><div>Gateway</div><div>Utilization</div><div/></div>
-      {forest.map(n=><NetworkRowGroup key={n.id} node={n} depth={0} sites={sites} ipCounts={ipCounts} onEdit={startEdit} onDelete={target=>void remove(target)}/>)}
+      {forest.map(n=><NetworkRowGroup key={n.id} node={n} depth={0} sites={sites} onEdit={startEdit} onDelete={target=>void remove(target)}/>)}
     </section>}
     {open&&<Modal title={editing?'Edit network':'Add network'} description="Document a routed prefix to assign addresses from." close={()=>setOpen(false)} save={()=>void save()} error={error} saveLabel={editing?'Save changes':'Add network'} saveDisabled={!form.prefix||!form.name}>
       <label>Prefix (CIDR)<input autoFocus value={form.prefix} onChange={e=>setForm(f=>({...f,prefix:e.target.value}))} placeholder="10.10.0.0/24 or 2001:db8::/48"/></label>

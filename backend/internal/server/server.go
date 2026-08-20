@@ -1139,6 +1139,19 @@ func (s *Server) list(resource string) http.HandlerFunc {
 			return
 		}
 		q := fmt.Sprintf("select row_to_json(t) from (select * from %s where tenant_id=$1 order by created_at desc limit $2 offset $3) t", table)
+		if resource == "networks" {
+			// Count by CIDR containment instead of the address row's direct
+			// network_id. An address assigned inside a nested subnet therefore
+			// contributes to that subnet and every containing parent network.
+			q = `select row_to_json(t) from (
+				select n.*,
+					(select count(*) from ip_addresses ip
+					 where ip.tenant_id=n.tenant_id and ip.address <<= n.prefix) as used_count
+				from networks n
+				where n.tenant_id=$1
+				order by n.created_at desc limit $2 offset $3
+			) t`
+		}
 		rows, err := s.q(r).Query(r.Context(), q, tenantID, size, (page-1)*size)
 		if err != nil {
 			fail(w, 500, "QUERY_FAILED", err.Error())
