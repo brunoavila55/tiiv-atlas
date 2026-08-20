@@ -13,6 +13,7 @@ Tiiv Atlas is a focused, self-hosted application for documenting sites, rooms, r
 - Per-organization white label with custom portal name, logo, and favicon
 - Role-based access with superadministrator, administrator, and viewer accounts
 - nginx serves the SPA and proxies `/api` to the Go service
+- phpIPAM-style address grid per network, with automatic subnet nesting and IPv4/IPv6 support (see [IP address management](#ip-address-management-ipam) below)
 
 ## Production quick start
 
@@ -92,11 +93,23 @@ The baseline migration is in `backend/db/migrations`, seed data is in `backend/d
 
 Migration `00010_fix_upsert_trigger_self_conflict.sql` switches the `devices_rack_collision` and `cable_ports_unique` triggers from `BEFORE` to `AFTER`. Postgres fires a `BEFORE INSERT` trigger against a row's proposed identity before `ON CONFLICT` resolves it, so every upsert (including re-running `seed.sql`) was falsely rejected as colliding with itself; genuine rack overlaps and duplicate port cabling are still rejected after the fix.
 
+Migration `00011_ip_assigned_to.sql` adds a nullable `assigned_to` text column to `ip_addresses`, so an address can be documented against a free-text name instead of (or alongside) a `device_id`.
+
 ## API overview
 
 All application routes are under `/api/v1`. Resources include sites, rooms, racks, manufacturers, device models, devices, ports, connections, networks, IP addresses, and VLANs. The API also exposes `/dashboard`, `/topology`, `/search?q=`, and authentication routes. Responses use `{ "data": ... }`; errors use `{ "error": { "code", "message" } }`. `GET /health` checks API and database readiness.
 
 List endpoints accept `page` and `page_size` (up to 100) and return a `meta.total` row count for the active organization alongside `meta.page`/`meta.page_size`, so clients can build page controls without a separate count query. The device and network screens are structured to add more server-side filters without a global client store.
+
+## IP address management (IPAM)
+
+Opening a network from **IP Management → Networks** shows `GET /networks/{id}/addresses`, a phpIPAM-style grid of that prefix's address space:
+
+- **IPv4** prefixes are expanded into one row per address (network and broadcast addresses are labeled, not hidden), so free and used addresses are visible at a glance without pre-creating a row per IP. Prefixes are capped at a `/20` (4,096 addresses); a larger prefix returns a `PREFIX_TOO_LARGE` error asking it to be narrowed or split.
+- **IPv6** prefixes are never expanded — a `/64` already has 2⁶⁴ addresses, so the grid instead lists only the addresses someone has explicitly documented, with an **Add address** action to type one in directly.
+- Any address can be assigned to a device already in inventory, to a free-text `assigned_to` name (e.g. a customer an IP was handed to, with no device involved), or left with neither and a `reserved`/`available` status.
+
+**Nested subnets** work by CIDR containment alone — there is no `parent_id` column. Creating `10.0.0.0/21` and `10.0.0.0/27` (or `2001:db8::/32` and `2001:db8:1::/48`) automatically links the narrower prefix under the wider one, in either creation order and at any depth, because the backend re-derives the relationship from Postgres's `cidr` `<<`/`>>` containment operators on every read. The **Networks** list renders the full hierarchy as a tree (indentation, a connector icon, and a subnet-count badge); a network's detail page shows a "Subnet of …" link up to its parent, a chip list of subnets nested inside it, and rolls a subnet's assigned addresses up into the parent's utilization count (tagged "via …" so it's clear where the assignment actually lives). An **Add subnet** button on the detail page creates a new network pre-scoped to nest inside the current one, with an inline live check confirming the prefix actually falls inside it before saving.
 
 ## Security notes
 
